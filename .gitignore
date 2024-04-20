@@ -1,0 +1,3 @@
+target/
+qemu/
+qemu-*.tar.xz
