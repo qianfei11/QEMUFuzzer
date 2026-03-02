@@ -1,3 +1,6 @@
 target/
 qemu/
 qemu-*.tar.xz
+corpus/
+crashes/
+sync/
