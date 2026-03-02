@@ -5,7 +5,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use libafl::{
@@ -37,15 +38,29 @@ const DEFAULT_TIMEOUT_MS: u64 = 1200;
 const DEFAULT_MAX_COMMANDS: usize = 16;
 const DEFAULT_SYNC_INTERVAL: u64 = 50;
 
-const DEVICE_DRIVERS: &[&str] = &["e1000", "rtl8139", "virtio-rng-pci", "edu", "pc-testdev"];
+const DEVICE_DRIVERS: &[&str] = &[
+    "e1000",
+    "rtl8139",
+    "virtio-rng-pci",
+    "edu",
+    "pc-testdev",
+    "virtio-net-pci",
+    "virtio-blk-pci",
+    "virtio-balloon-pci",
+    "pvpanic-pci",
+    "virtio-serial-pci",
+];
 const QUERY_COMMANDS: &[&str] = &[
     "query-status",
     "query-version",
+    "query-qmp-schema",
     "query-machines",
     "query-cpus-fast",
     "query-hotpluggable-cpus",
     "query-memory-devices",
     "query-pci",
+    "query-target",
+    "query-kvm",
     "query-commands",
 ];
 const HMP_COMMANDS: &[&str] = &[
@@ -58,6 +73,16 @@ const HMP_COMMANDS: &[&str] = &[
     "info qom-tree",
     "info irq",
 ];
+const QOM_PATHS: &[&str] = &[
+    "/machine",
+    "/machine/peripheral",
+    "/machine/unattached",
+    "/objects",
+    "/chardevs",
+];
+const QOM_PROPERTIES: &[&str] = &["type", "id", "realized", "hotplugged", "driver", "name"];
+const CMDLINE_OPTIONS: &[&str] = &["device", "machine", "cpu", "accel", "netdev"];
+const OBJECT_TYPES: &[&str] = &["rng-random", "iothread", "memory-backend-ram"];
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -73,6 +98,8 @@ struct Config {
     worker_id: Option<usize>,
     sync_interval: u64,
     debug_qemu: bool,
+    validate_dir: Option<PathBuf>,
+    validated_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -90,6 +117,8 @@ impl Default for Config {
             worker_id: None,
             sync_interval: DEFAULT_SYNC_INTERVAL,
             debug_qemu: false,
+            validate_dir: None,
+            validated_dir: None,
         }
     }
 }
@@ -99,7 +128,11 @@ struct WorkerPaths {
     queue_root: PathBuf,
     worker_queue_dir: PathBuf,
     objective_root: PathBuf,
-    worker_objective_dir: PathBuf,
+    worker_objective_base_dir: PathBuf,
+    worker_objective_all_dir: PathBuf,
+    worker_crash_only_dir: PathBuf,
+    worker_timeout_dir: PathBuf,
+    worker_unknown_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,30 +273,87 @@ fn push_device_del(cmds: &mut String, id: &str) {
     cmds.push_str("\"}}\n");
 }
 
+fn push_object_add(cmds: &mut String, qom_type: &str, id: &str, size_mb: u64) {
+    match qom_type {
+        "memory-backend-ram" => {
+            cmds.push_str("{\"execute\":\"object-add\",\"arguments\":{\"qom-type\":\"");
+            cmds.push_str(qom_type);
+            cmds.push_str("\",\"id\":\"");
+            cmds.push_str(id);
+            cmds.push_str("\",\"size\":");
+            cmds.push_str(&(size_mb.saturating_mul(1024 * 1024)).to_string());
+            cmds.push_str("}}\n");
+        }
+        _ => {
+            cmds.push_str("{\"execute\":\"object-add\",\"arguments\":{\"qom-type\":\"");
+            cmds.push_str(qom_type);
+            cmds.push_str("\",\"id\":\"");
+            cmds.push_str(id);
+            cmds.push_str("\"}}\n");
+        }
+    }
+}
+
+fn push_object_del(cmds: &mut String, id: &str) {
+    cmds.push_str("{\"execute\":\"object-del\",\"arguments\":{\"id\":\"");
+    cmds.push_str(id);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_qom_list(cmds: &mut String, path: &str) {
+    cmds.push_str("{\"execute\":\"qom-list\",\"arguments\":{\"path\":\"");
+    cmds.push_str(path);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_qom_get(cmds: &mut String, path: &str, property: &str) {
+    cmds.push_str("{\"execute\":\"qom-get\",\"arguments\":{\"path\":\"");
+    cmds.push_str(path);
+    cmds.push_str("\",\"property\":\"");
+    cmds.push_str(property);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_query_cmdline_options(cmds: &mut String, option: &str) {
+    cmds.push_str("{\"execute\":\"query-command-line-options\",\"arguments\":{\"option\":\"");
+    cmds.push_str(option);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_device_list_properties(cmds: &mut String, driver: &str) {
+    cmds.push_str("{\"execute\":\"device-list-properties\",\"arguments\":{\"typename\":\"");
+    cmds.push_str(driver);
+    cmds.push_str("\"}}\n");
+}
+
 fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut cmds = String::with_capacity(1024);
     let mut next_device_id: u64 = 0;
+    let mut next_object_id: u64 = 0;
     let mut live_devices: Vec<String> = Vec::new();
+    let mut live_objects: Vec<String> = Vec::new();
 
     push_exec(&mut cmds, "qmp_capabilities");
     push_exec(&mut cmds, "query-commands");
 
-    for chunk in data.chunks(3).take(max_commands) {
-        let op = chunk[0] % 6;
+    for chunk in data.chunks(4).take(max_commands) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let b3 = chunk.get(3).copied().unwrap_or(0);
+        let op = b0 % 12;
+
         match op {
             0 => {
-                let query = QUERY_COMMANDS
-                    [(chunk.get(1).copied().unwrap_or(0) as usize) % QUERY_COMMANDS.len()];
+                let query = QUERY_COMMANDS[(b1 as usize) % QUERY_COMMANDS.len()];
                 push_exec(&mut cmds, query);
             }
             1 => {
-                let hmp = HMP_COMMANDS
-                    [(chunk.get(1).copied().unwrap_or(0) as usize) % HMP_COMMANDS.len()];
+                let hmp = HMP_COMMANDS[(b1 as usize) % HMP_COMMANDS.len()];
                 push_hmp(&mut cmds, hmp);
             }
             2 => {
-                let driver = DEVICE_DRIVERS
-                    [(chunk.get(1).copied().unwrap_or(0) as usize) % DEVICE_DRIVERS.len()];
+                let driver = DEVICE_DRIVERS[(b1 as usize) % DEVICE_DRIVERS.len()];
                 let id = format!("dev{next_device_id}");
                 next_device_id += 1;
                 push_device_add(&mut cmds, driver, &id);
@@ -273,24 +363,71 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 if live_devices.is_empty() {
                     push_exec(&mut cmds, "query-status");
                 } else {
-                    let pick = (chunk.get(1).copied().unwrap_or(0) as usize) % live_devices.len();
+                    let pick = (b1 as usize) % live_devices.len();
                     let id = live_devices.swap_remove(pick);
                     push_device_del(&mut cmds, &id);
                 }
             }
             4 => {
-                cmds.push_str("{\"execute\":\"qom-list\",\"arguments\":{\"path\":\"/machine\"}}\n");
+                let path = QOM_PATHS[(b1 as usize) % QOM_PATHS.len()];
+                push_qom_list(&mut cmds, path);
+            }
+            5 => {
+                let option = CMDLINE_OPTIONS[(b1 as usize) % CMDLINE_OPTIONS.len()];
+                push_query_cmdline_options(&mut cmds, option);
+            }
+            6 => {
+                let qom_type = OBJECT_TYPES[(b1 as usize) % OBJECT_TYPES.len()];
+                let id = format!("obj{next_object_id}");
+                next_object_id += 1;
+                let size_mb = ((b2 as u64) % 64) + 1;
+                push_object_add(&mut cmds, qom_type, &id, size_mb);
+                live_objects.push(id);
+            }
+            7 => {
+                if live_objects.is_empty() {
+                    push_exec(&mut cmds, "query-status");
+                } else {
+                    let pick = (b1 as usize) % live_objects.len();
+                    let id = live_objects.swap_remove(pick);
+                    push_object_del(&mut cmds, &id);
+                }
+            }
+            8 => {
+                let path = QOM_PATHS[(b1 as usize) % QOM_PATHS.len()];
+                let property = QOM_PROPERTIES[(b2 as usize) % QOM_PROPERTIES.len()];
+                push_qom_get(&mut cmds, path, property);
+            }
+            9 => {
+                if b1 & 0x1 == 0 {
+                    push_exec(&mut cmds, "stop");
+                } else {
+                    push_exec(&mut cmds, "cont");
+                }
+                if b2 & 0x1 == 0 {
+                    push_exec(&mut cmds, "query-status");
+                }
+            }
+            10 => {
+                let driver = DEVICE_DRIVERS[(b1 as usize) % DEVICE_DRIVERS.len()];
+                push_device_list_properties(&mut cmds, driver);
             }
             _ => {
-                cmds.push_str(
-                    "{\"execute\":\"query-command-line-options\",\"arguments\":{\"option\":\"device\"}}\n",
-                );
+                if b3 & 0x1 == 0 {
+                    push_exec(&mut cmds, "qom-list-types");
+                } else {
+                    push_exec(&mut cmds, "query-qmp-schema");
+                }
             }
         }
     }
 
+    push_exec(&mut cmds, "cont");
     for id in &live_devices {
         push_device_del(&mut cmds, id);
+    }
+    for id in &live_objects {
+        push_object_del(&mut cmds, id);
     }
     push_exec(&mut cmds, "quit");
     cmds.into_bytes()
@@ -302,7 +439,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 6] = [
+    let seeds: [(&str, &[u8]); 12] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -312,6 +449,18 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         ),
         ("seed-qom.bin", &[0x04, 0x00, 0x00]),
         ("seed-options.bin", &[0x05, 0x00, 0x00]),
+        ("seed-object-add.bin", &[0x06, 0x00, 0x10, 0x00]),
+        (
+            "seed-object-cycle.bin",
+            &[0x06, 0x01, 0x08, 0x00, 0x07, 0x00, 0x00, 0x00],
+        ),
+        ("seed-qom-get.bin", &[0x08, 0x00, 0x00, 0x00]),
+        (
+            "seed-stop-cont.bin",
+            &[0x09, 0x00, 0x01, 0x00, 0x09, 0x01, 0x01, 0x00],
+        ),
+        ("seed-list-properties.bin", &[0x0a, 0x00, 0x00, 0x00]),
+        ("seed-qom-types.bin", &[0x0b, 0x00, 0x00, 0x00]),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
@@ -325,17 +474,25 @@ fn worker_paths(cfg: &Config, worker_id: usize) -> WorkerPaths {
     let worker_queue_dir = queue_root.join(worker_label.clone());
 
     let objective_root = cfg.crashes_dir.clone();
-    let worker_objective_dir = if cfg.worker_id.is_some() || cfg.jobs > 1 {
+    let worker_objective_base_dir = if cfg.worker_id.is_some() || cfg.jobs > 1 {
         objective_root.join(worker_label)
     } else {
         objective_root.clone()
     };
+    let worker_objective_all_dir = worker_objective_base_dir.join("all");
+    let worker_crash_only_dir = worker_objective_base_dir.join("crashes");
+    let worker_timeout_dir = worker_objective_base_dir.join("timeouts");
+    let worker_unknown_dir = worker_objective_base_dir.join("unknown");
 
     WorkerPaths {
         queue_root,
         worker_queue_dir,
         objective_root,
-        worker_objective_dir,
+        worker_objective_base_dir,
+        worker_objective_all_dir,
+        worker_crash_only_dir,
+        worker_timeout_dir,
+        worker_unknown_dir,
     }
 }
 
@@ -369,6 +526,209 @@ fn collect_input_files(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayVerdict {
+    Ok,
+    Crash,
+    Timeout,
+}
+
+fn replay_one_input(cfg: &Config, input: &BytesInput) -> io::Result<ReplayVerdict> {
+    let payload = qmp_program_from_bytes(input.target_bytes().as_slice(), cfg.max_commands);
+    let mut cmd = Command::new(&cfg.qemu_bin);
+    cmd.arg("-machine")
+        .arg(&cfg.machine)
+        .arg("-display")
+        .arg("none")
+        .arg("-monitor")
+        .arg("none")
+        .arg("-serial")
+        .arg("none")
+        .arg("-qmp")
+        .arg("stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    if cfg.debug_qemu {
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.stderr(Stdio::null());
+    }
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture replay stdin"))?;
+    if let Err(err) = stdin.write_all(&payload) {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(err);
+        }
+    }
+    if let Err(err) = stdin.flush() {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(err);
+        }
+    }
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(ReplayVerdict::Ok)
+            } else {
+                Ok(ReplayVerdict::Crash)
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(ReplayVerdict::Timeout);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn validate_objective_corpus(cfg: &Config, validate_dir: &Path) -> Result<(), Error> {
+    if !cfg.qemu_bin.exists() {
+        return Err(Error::illegal_argument(format!(
+            "QEMU binary does not exist: {}",
+            cfg.qemu_bin.display()
+        )));
+    }
+    if !validate_dir.exists() {
+        return Err(Error::illegal_argument(format!(
+            "validation input dir does not exist: {}",
+            validate_dir.display()
+        )));
+    }
+
+    let files = collect_input_files(&[validate_dir.to_path_buf()])?;
+    if files.is_empty() {
+        println!(
+            "No candidate files found under {}; nothing to validate.",
+            validate_dir.display()
+        );
+        return Ok(());
+    }
+
+    let validated_root = cfg
+        .validated_dir
+        .clone()
+        .unwrap_or_else(|| validate_dir.join("validated"));
+    let crash_out = validated_root.join("repro-crash");
+    let timeout_out = validated_root.join("repro-timeout");
+    let invalid_out = validated_root.join("not-repro");
+    fs::create_dir_all(&crash_out)?;
+    fs::create_dir_all(&timeout_out)?;
+    fs::create_dir_all(&invalid_out)?;
+
+    let mut repro_crash = 0usize;
+    let mut repro_timeout = 0usize;
+    let mut not_repro = 0usize;
+    for (idx, path) in files.iter().enumerate() {
+        let data = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("failed to read {}: {err}", path.display());
+                not_repro += 1;
+                continue;
+            }
+        };
+        if data.is_empty() {
+            not_repro += 1;
+            continue;
+        }
+
+        let input = BytesInput::new(data);
+        let verdict = replay_one_input(cfg, &input)?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("candidate.bin");
+        let dest_name = format!("{idx:06}-{name}");
+
+        match verdict {
+            ReplayVerdict::Crash => {
+                fs::copy(path, crash_out.join(dest_name))?;
+                repro_crash += 1;
+            }
+            ReplayVerdict::Timeout => {
+                fs::copy(path, timeout_out.join(dest_name))?;
+                repro_timeout += 1;
+            }
+            ReplayVerdict::Ok => {
+                fs::copy(path, invalid_out.join(dest_name))?;
+                not_repro += 1;
+            }
+        }
+    }
+
+    println!("Validated {} candidate inputs", files.len());
+    println!("  reproducible crashes : {repro_crash}");
+    println!("  reproducible timeouts: {repro_timeout}");
+    println!("  not reproducible     : {not_repro}");
+    println!("  validated output dir : {}", validated_root.display());
+    Ok(())
+}
+
+fn count_inputs_in_dir(path: &Path) -> io::Result<usize> {
+    collect_input_files(&[path.to_path_buf()]).map(|v| v.len())
+}
+
+fn classify_objective_files(
+    cfg: &Config,
+    paths: &WorkerPaths,
+) -> Result<(usize, usize, usize), Error> {
+    let files = collect_input_files(&[paths.worker_objective_all_dir.clone()])?;
+    let mut crash_count = 0usize;
+    let mut timeout_count = 0usize;
+    let mut unknown_count = 0usize;
+
+    for path in files {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let crash_dest = paths.worker_crash_only_dir.join(name);
+        let timeout_dest = paths.worker_timeout_dir.join(name);
+        let unknown_dest = paths.worker_unknown_dir.join(name);
+        if crash_dest.exists() || timeout_dest.exists() || unknown_dest.exists() {
+            continue;
+        }
+
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(_) => {
+                fs::copy(&path, &unknown_dest)?;
+                unknown_count += 1;
+                continue;
+            }
+        };
+        if data.is_empty() {
+            fs::copy(&path, &unknown_dest)?;
+            unknown_count += 1;
+            continue;
+        }
+
+        let input = BytesInput::new(data);
+        match replay_one_input(cfg, &input)? {
+            ReplayVerdict::Crash => {
+                fs::copy(&path, &crash_dest)?;
+                crash_count += 1;
+            }
+            ReplayVerdict::Timeout => {
+                fs::copy(&path, &timeout_dest)?;
+                timeout_count += 1;
+            }
+            ReplayVerdict::Ok => {
+                fs::copy(&path, &unknown_dest)?;
+                unknown_count += 1;
+            }
+        }
+    }
+    Ok((crash_count, timeout_count, unknown_count))
 }
 
 fn parse_next<T: std::str::FromStr>(
@@ -406,6 +766,8 @@ fn print_help() {
     println!(
         "  --sync-interval N     Queue sync stage period in fuzz iterations (default: {DEFAULT_SYNC_INTERVAL})"
     );
+    println!("  --validate-dir PATH   Validate corpus files under PATH (replay mode)");
+    println!("  --validated-dir PATH  Output dir for validated results (replay mode)");
     println!("  --debug-qemu          Keep QEMU stderr visible");
     println!("  -h, --help            Show this help");
 }
@@ -429,6 +791,12 @@ fn parse_args() -> Result<Config, String> {
             "--jobs" => cfg.jobs = parse_next::<usize>(&mut args, &arg)?,
             "--worker-id" => cfg.worker_id = Some(parse_next::<usize>(&mut args, &arg)?),
             "--sync-interval" => cfg.sync_interval = parse_next::<u64>(&mut args, &arg)?,
+            "--validate-dir" => {
+                cfg.validate_dir = Some(PathBuf::from(parse_next::<String>(&mut args, &arg)?))
+            }
+            "--validated-dir" => {
+                cfg.validated_dir = Some(PathBuf::from(parse_next::<String>(&mut args, &arg)?))
+            }
             "--debug-qemu" => cfg.debug_qemu = true,
             "-h" | "--help" => {
                 print_help();
@@ -456,6 +824,9 @@ fn parse_args() -> Result<Config, String> {
     if cfg.worker_id.is_some() && cfg.jobs != 1 {
         return Err("--worker-id requires --jobs 1".to_string());
     }
+    if cfg.validate_dir.is_some() && (cfg.jobs != 1 || cfg.worker_id.is_some()) {
+        return Err("--validate-dir cannot be combined with --jobs > 1 or --worker-id".to_string());
+    }
     Ok(cfg)
 }
 
@@ -473,10 +844,14 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
     fs::create_dir_all(&paths.queue_root)?;
     fs::create_dir_all(&paths.worker_queue_dir)?;
     fs::create_dir_all(&paths.objective_root)?;
-    fs::create_dir_all(&paths.worker_objective_dir)?;
+    fs::create_dir_all(&paths.worker_objective_base_dir)?;
+    fs::create_dir_all(&paths.worker_objective_all_dir)?;
+    fs::create_dir_all(&paths.worker_crash_only_dir)?;
+    fs::create_dir_all(&paths.worker_timeout_dir)?;
+    fs::create_dir_all(&paths.worker_unknown_dir)?;
 
     let input_corpus = InMemoryOnDiskCorpus::<BytesInput>::no_meta(paths.worker_queue_dir.clone())?;
-    let objective_corpus = OnDiskCorpus::new(paths.worker_objective_dir.clone())?;
+    let objective_corpus = OnDiskCorpus::new(paths.worker_objective_all_dir.clone())?;
 
     let time_observer = TimeObserver::new("time");
     let stdout_hash_observer = StdOutHashObserver::new("stdout_hash");
@@ -546,14 +921,25 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         StdMutationalStage::with_max_iterations(mutator, 1)
     );
 
+    let (new_crashes_pre, new_timeouts_pre, new_unknowns_pre) =
+        classify_objective_files(cfg, &paths)?;
+    if new_crashes_pre + new_timeouts_pre + new_unknowns_pre > 0 {
+        println!(
+            "[worker {worker_id:03}] classified existing objectives: +{} crashes, +{} timeouts, +{} unknown",
+            new_crashes_pre, new_timeouts_pre, new_unknowns_pre
+        );
+    }
+
     println!(
-        "[worker {worker_id:03}] start fuzzing: qemu={}, machine={}, iters={}, timeout={}ms, queue_dir={}, objective_dir={}, sync_every={}",
+        "[worker {worker_id:03}] start fuzzing: qemu={}, machine={}, iters={}, timeout={}ms, queue_dir={}, objective_all_dir={}, crash_dir={}, timeout_dir={}, sync_every={}",
         cfg.qemu_bin.display(),
         cfg.machine,
         cfg.iterations,
         cfg.timeout_ms,
         paths.worker_queue_dir.display(),
-        paths.worker_objective_dir.display(),
+        paths.worker_objective_all_dir.display(),
+        paths.worker_crash_only_dir.display(),
+        paths.worker_timeout_dir.display(),
         cfg.sync_interval
     );
 
@@ -565,6 +951,18 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         cfg.iterations,
     )?;
 
+    let (new_crashes, new_timeouts, new_unknowns) = classify_objective_files(cfg, &paths)?;
+    if new_crashes + new_timeouts + new_unknowns > 0 {
+        println!(
+            "[worker {worker_id:03}] classified objectives: +{} crashes, +{} timeouts, +{} unknown",
+            new_crashes, new_timeouts, new_unknowns
+        );
+    }
+
+    let crash_only_count = count_inputs_in_dir(&paths.worker_crash_only_dir)?;
+    let timeout_count = count_inputs_in_dir(&paths.worker_timeout_dir)?;
+    let unknown_count = count_inputs_in_dir(&paths.worker_unknown_dir)?;
+
     println!("[worker {worker_id:03}] finished");
     println!("[worker {worker_id:03}] executions: {}", state.executions());
     println!(
@@ -572,15 +970,27 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         state.corpus().count()
     );
     println!(
-        "[worker {worker_id:03}] objective entries: {}",
+        "[worker {worker_id:03}] objective entries (all): {}",
         state.solutions().count()
+    );
+    println!(
+        "[worker {worker_id:03}] crash objectives: {}",
+        crash_only_count
+    );
+    println!(
+        "[worker {worker_id:03}] timeout objectives: {}",
+        timeout_count
+    );
+    println!(
+        "[worker {worker_id:03}] unknown objectives: {}",
+        unknown_count
     );
     println!(
         "[worker {worker_id:03}] shared queue root: {}",
         paths.queue_root.display()
     );
     println!(
-        "[worker {worker_id:03}] shared objective root: {}",
+        "[worker {worker_id:03}] objective root: {}",
         paths.objective_root.display()
     );
     Ok(())
@@ -641,6 +1051,10 @@ fn launch_parallel_workers(cfg: &Config) -> Result<(), Error> {
 
 fn main() -> Result<(), Error> {
     let cfg = parse_args().map_err(Error::illegal_argument)?;
+
+    if let Some(validate_dir) = cfg.validate_dir.clone() {
+        return validate_objective_corpus(&cfg, &validate_dir);
+    }
 
     if cfg.jobs > 1 && cfg.worker_id.is_none() {
         return launch_parallel_workers(&cfg);
