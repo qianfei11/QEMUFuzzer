@@ -182,6 +182,33 @@ where
     }
 }
 
+/// Build the base QEMU command shared by both the fuzzer executor and the replay harness.
+/// The caller is responsible for setting `.stdout(...)` as appropriate (piped for the
+/// executor, null for standalone replay).
+fn build_base_qemu_command(qemu_bin: &Path, machine: &str, debug: bool) -> Command {
+    let mut cmd = Command::new(qemu_bin);
+    cmd.arg("-machine")
+        .arg(machine)
+        .arg("-display")
+        .arg("none")
+        .arg("-monitor")
+        .arg("none")
+        .arg("-serial")
+        .arg("none")
+        // Prevent QEMU from looping on guest reboot/reset events; it must exit instead.
+        .arg("-no-reboot")
+        .arg("-qmp")
+        .arg("stdio")
+        .stdin(Stdio::piped());
+
+    if debug {
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.stderr(Stdio::null());
+    }
+    cmd
+}
+
 #[derive(Debug)]
 struct QmpConfigurator {
     qemu_bin: PathBuf,
@@ -193,25 +220,9 @@ struct QmpConfigurator {
 
 impl QmpConfigurator {
     fn command_template(&self) -> Command {
-        let mut cmd = Command::new(&self.qemu_bin);
-        cmd.arg("-machine")
-            .arg(&self.machine)
-            .arg("-display")
-            .arg("none")
-            .arg("-monitor")
-            .arg("none")
-            .arg("-serial")
-            .arg("none")
-            .arg("-qmp")
-            .arg("stdio")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-
-        if self.debug_child {
-            cmd.stderr(Stdio::inherit());
-        } else {
-            cmd.stderr(Stdio::null());
-        }
+        let mut cmd =
+            build_base_qemu_command(&self.qemu_bin, &self.machine, self.debug_child);
+        cmd.stdout(Stdio::piped());
         cmd
     }
 }
@@ -332,6 +343,10 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut next_object_id: u64 = 0;
     let mut live_devices: Vec<String> = Vec::new();
     let mut live_objects: Vec<String> = Vec::new();
+    // Track whether the VM is currently paused so we only send `cont` in
+    // cleanup when actually needed.  Sending `cont` to a running VM returns
+    // an error response that pollutes the stdout hash and inflates the corpus.
+    let mut vm_paused = false;
 
     push_exec(&mut cmds, "qmp_capabilities");
     push_exec(&mut cmds, "query-commands");
@@ -401,8 +416,10 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
             9 => {
                 if b1 & 0x1 == 0 {
                     push_exec(&mut cmds, "stop");
+                    vm_paused = true;
                 } else {
                     push_exec(&mut cmds, "cont");
+                    vm_paused = false;
                 }
                 if b2 & 0x1 == 0 {
                     push_exec(&mut cmds, "query-status");
@@ -422,7 +439,10 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         }
     }
 
-    push_exec(&mut cmds, "cont");
+    // Resume the VM before cleanup only if it was left in a paused state.
+    if vm_paused {
+        push_exec(&mut cmds, "cont");
+    }
     for id in &live_devices {
         push_device_del(&mut cmds, id);
     }
@@ -444,8 +464,11 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
         (
+            // chunk-1: op=2 (device_add, driver=e1000, id=dev0)
+            // chunk-2: op=3 (device_del, pick=0 → dev0)
+            // Exercises the in-loop device_del path (op=3).
             "seed-device-cycle.bin",
-            &[0x02, 0x02, 0x00, 0x03, 0x00, 0x00],
+            &[0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
         ),
         ("seed-qom.bin", &[0x04, 0x00, 0x00]),
         ("seed-options.bin", &[0x05, 0x00, 0x00]),
@@ -537,24 +560,8 @@ enum ReplayVerdict {
 
 fn replay_one_input(cfg: &Config, input: &BytesInput) -> io::Result<ReplayVerdict> {
     let payload = qmp_program_from_bytes(input.target_bytes().as_slice(), cfg.max_commands);
-    let mut cmd = Command::new(&cfg.qemu_bin);
-    cmd.arg("-machine")
-        .arg(&cfg.machine)
-        .arg("-display")
-        .arg("none")
-        .arg("-monitor")
-        .arg("none")
-        .arg("-serial")
-        .arg("none")
-        .arg("-qmp")
-        .arg("stdio")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null());
-    if cfg.debug_qemu {
-        cmd.stderr(Stdio::inherit());
-    } else {
-        cmd.stderr(Stdio::null());
-    }
+    let mut cmd = build_base_qemu_command(&cfg.qemu_bin, &cfg.machine, cfg.debug_qemu);
+    cmd.stdout(Stdio::null());
 
     let mut child = cmd.spawn()?;
     let mut stdin = child
