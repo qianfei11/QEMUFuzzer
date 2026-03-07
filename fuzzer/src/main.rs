@@ -197,21 +197,34 @@ where
 /// hash differently and every input to be added to the corpus (19 GB of noise in
 /// 12 h of fuzzing).  We replace those digit sequences with the literal `0`.
 fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
+    // Patterns where a digit sequence immediately follows (after optional spaces).
     const PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":"];
+    // Patterns where digits follow directly with no intervening characters.
+    // "#netNNN:" appears in `hmp info network` output and uses a per-process counter.
+    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net"];
     let mut out = Vec::with_capacity(stdout.len());
     let mut i = 0;
     'byte: while i < stdout.len() {
         for pat in PATTERNS {
             if stdout[i..].starts_with(pat) {
-                // Copy the key name verbatim.
                 out.extend_from_slice(pat);
                 i += pat.len();
-                // Copy any whitespace that separates the colon from the number.
+                // Copy any whitespace between the colon and the number.
                 while i < stdout.len() && stdout[i] == b' ' {
                     out.push(stdout[i]);
                     i += 1;
                 }
-                // Skip the actual digit sequence and replace it with a fixed "0".
+                while i < stdout.len() && stdout[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(b'0');
+                continue 'byte;
+            }
+        }
+        for pat in DIRECT_PATTERNS {
+            if stdout[i..].starts_with(pat) {
+                out.extend_from_slice(pat);
+                i += pat.len();
                 while i < stdout.len() && stdout[i].is_ascii_digit() {
                     i += 1;
                 }
