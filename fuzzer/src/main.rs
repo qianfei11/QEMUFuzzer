@@ -197,19 +197,25 @@ where
 /// hash differently and every input to be added to the corpus (19 GB of noise in
 /// 12 h of fuzzing).  We replace those digit sequences with the literal `0`.
 fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
-    // Patterns where a digit sequence immediately follows (after optional spaces).
-    const PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":"];
-    // Patterns where digits follow directly with no intervening characters.
-    // "#netNNN:" appears in `hmp info network` output and uses a per-process counter.
-    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net"];
+    // Patterns followed by optional whitespace then a digit sequence.
+    // Used for JSON timestamp fields: "seconds": 12345 → "seconds": 0
+    const SPACED_PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":"];
+
+    // Patterns that must be immediately followed by at least one digit (no separator).
+    // Only normalised when a digit is actually present, preventing false matches on
+    // words like "'device'" that share a prefix with "'dev<NNN>'".
+    //   "#netNNN"  – internal netdev counter in `hmp info network` output
+    //   "'devNNN'" – device ID echoed back in DeviceNotFound error messages
+    //   "'memNNN'" – object ID echoed back in object-not-found error messages
+    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net", b"'dev", b"'mem"];
+
     let mut out = Vec::with_capacity(stdout.len());
     let mut i = 0;
     'byte: while i < stdout.len() {
-        for pat in PATTERNS {
+        for pat in SPACED_PATTERNS {
             if stdout[i..].starts_with(pat) {
                 out.extend_from_slice(pat);
                 i += pat.len();
-                // Copy any whitespace between the colon and the number.
                 while i < stdout.len() && stdout[i] == b' ' {
                     out.push(stdout[i]);
                     i += 1;
@@ -223,13 +229,18 @@ fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
         }
         for pat in DIRECT_PATTERNS {
             if stdout[i..].starts_with(pat) {
-                out.extend_from_slice(pat);
-                i += pat.len();
-                while i < stdout.len() && stdout[i].is_ascii_digit() {
-                    i += 1;
+                let digits_start = i + pat.len();
+                let mut j = digits_start;
+                while j < stdout.len() && stdout[j].is_ascii_digit() {
+                    j += 1;
                 }
-                out.push(b'0');
-                continue 'byte;
+                // Only normalise when at least one digit follows the prefix.
+                if j > digits_start {
+                    out.extend_from_slice(pat);
+                    out.push(b'0');
+                    i = j;
+                    continue 'byte;
+                }
             }
         }
         out.push(stdout[i]);
