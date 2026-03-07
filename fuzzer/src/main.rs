@@ -16,16 +16,21 @@ use libafl::{
     feedback_or,
     feedbacks::{CrashFeedback, NewHashFeedback, TimeFeedback, TimeoutFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
-    inputs::{BytesInput, HasTargetBytes, Input, UsesInput},
+    inputs::{BytesInput, HasBytesVec, HasTargetBytes, Input, UsesInput},
     monitors::SimpleMonitor,
-    mutators::{havoc_mutations, StdScheduledMutator},
+    mutators::{havoc_mutations, MutationResult, Mutator, StdScheduledMutator},
     observers::{Observer, ObserverWithHashField, TimeObserver},
     schedulers::QueueScheduler,
     stages::{IfStage, StdMutationalStage, SyncFromDiskStage},
-    state::{HasCorpus, HasExecutions, HasSolutions, StdState},
+    state::{HasCorpus, HasExecutions, HasRand, HasSolutions, StdState},
     Error,
 };
-use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice, Named};
+use libafl_bolts::{
+    current_nanos,
+    rands::{Rand, StdRand},
+    tuples::tuple_list,
+    AsSlice, Named,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_QEMU_BIN: &str = "/usr/bin/qemu-system-x86_64";
@@ -176,10 +181,48 @@ where
     }
 
     fn observe_stdout(&mut self, stdout: &[u8]) {
+        let normalized = normalize_qemu_stdout(stdout);
         let mut hasher = DefaultHasher::new();
-        stdout.hash(&mut hasher);
+        normalized.hash(&mut hasher);
         self.hash = Some(hasher.finish());
     }
+}
+
+/// Strips the non-deterministic numeric values from QEMU QMP timestamp fields so
+/// that the same logical execution always produces the same stdout hash.
+///
+/// QEMU emits events like:
+///   {"event":"SHUTDOWN","timestamp":{"seconds":1772808637,"microseconds":975681},...}
+/// The seconds/microseconds values differ on every run, causing every stdout to
+/// hash differently and every input to be added to the corpus (19 GB of noise in
+/// 12 h of fuzzing).  We replace those digit sequences with the literal `0`.
+fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
+    const PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":"];
+    let mut out = Vec::with_capacity(stdout.len());
+    let mut i = 0;
+    'byte: while i < stdout.len() {
+        for pat in PATTERNS {
+            if stdout[i..].starts_with(pat) {
+                // Copy the key name verbatim.
+                out.extend_from_slice(pat);
+                i += pat.len();
+                // Copy any whitespace that separates the colon from the number.
+                while i < stdout.len() && stdout[i] == b' ' {
+                    out.push(stdout[i]);
+                    i += 1;
+                }
+                // Skip the actual digit sequence and replace it with a fixed "0".
+                while i < stdout.len() && stdout[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(b'0');
+                continue 'byte;
+            }
+        }
+        out.push(stdout[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Build the base QEMU command shared by both the fuzzer executor and the replay harness.
@@ -189,6 +232,10 @@ fn build_base_qemu_command(qemu_bin: &Path, machine: &str, debug: bool) -> Comma
     let mut cmd = Command::new(qemu_bin);
     cmd.arg("-machine")
         .arg(machine)
+        .arg("-m")
+        .arg("64m")
+        .arg("-smp")
+        .arg("1")
         .arg("-display")
         .arg("none")
         .arg("-monitor")
@@ -337,6 +384,93 @@ fn push_device_list_properties(cmds: &mut String, driver: &str) {
     cmds.push_str("\"}}\n");
 }
 
+// ── Chunk-aware mutators ──────────────────────────────────────────────────────
+//
+// The fuzzer input is a sequence of 4-byte chunks:
+//   b0: operation selector  (op = b0 % 12)
+//   b1: argument 1          (selects from QUERY_COMMANDS, DEVICE_DRIVERS, …)
+//   b2: argument 2          (size, secondary selector)
+//   b3: argument 3          (binary flag for some ops)
+//
+// Generic byte-level havoc mutations can corrupt chunk alignment, so we add two
+// mutators that understand the structure.
+
+/// Mutates one argument byte (b1, b2, or b3) within a randomly chosen chunk
+/// while leaving the operation selector (b0) intact.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ChunkArgMutator;
+
+impl Named for ChunkArgMutator {
+    fn name(&self) -> &str {
+        "ChunkArgMutator"
+    }
+}
+
+impl<I, S> Mutator<I, S> for ChunkArgMutator
+where
+    I: HasBytesVec,
+    S: HasRand,
+{
+    fn mutate(
+        &mut self,
+        state: &mut S,
+        input: &mut I,
+        _stage_idx: i32,
+    ) -> Result<MutationResult, Error> {
+        let bytes = input.bytes_mut();
+        if bytes.len() < 2 {
+            return Ok(MutationResult::Skipped);
+        }
+        // 75 % of all byte positions are argument bytes (offset != 0 in chunk).
+        // Up to 8 retries gives a >99.998 % success rate even for short inputs.
+        for _ in 0..8 {
+            let idx = state.rand_mut().below(bytes.len() as u64) as usize;
+            if idx % 4 != 0 {
+                bytes[idx] = state.rand_mut().below(256) as u8;
+                return Ok(MutationResult::Mutated);
+            }
+        }
+        Ok(MutationResult::Skipped)
+    }
+}
+
+/// Mutates the operation-selector byte (b0) of a randomly chosen chunk,
+/// replacing it with a direct op index (0–11) to guarantee a valid operation.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ChunkOpMutator;
+
+impl Named for ChunkOpMutator {
+    fn name(&self) -> &str {
+        "ChunkOpMutator"
+    }
+}
+
+impl<I, S> Mutator<I, S> for ChunkOpMutator
+where
+    I: HasBytesVec,
+    S: HasRand,
+{
+    fn mutate(
+        &mut self,
+        state: &mut S,
+        input: &mut I,
+        _stage_idx: i32,
+    ) -> Result<MutationResult, Error> {
+        let bytes = input.bytes_mut();
+        if bytes.is_empty() {
+            return Ok(MutationResult::Skipped);
+        }
+        let num_chunks = (bytes.len() + 3) / 4;
+        let byte_idx = state.rand_mut().below(num_chunks as u64) as usize * 4;
+        if byte_idx >= bytes.len() {
+            return Ok(MutationResult::Skipped);
+        }
+        // Write a direct op index so b0 % 12 lands exactly on the chosen op.
+        bytes[byte_idx] = state.rand_mut().below(12) as u8;
+        Ok(MutationResult::Mutated)
+    }
+}
+
 fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut cmds = String::with_capacity(1024);
     let mut next_device_id: u64 = 0;
@@ -349,7 +483,9 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut vm_paused = false;
 
     push_exec(&mut cmds, "qmp_capabilities");
-    push_exec(&mut cmds, "query-commands");
+    // Note: query-commands is intentionally omitted from the preamble.
+    // It produces a ~5 KB constant JSON blob per execution (wasting pipe bandwidth)
+    // and is already reachable via op=0 (QUERY_COMMANDS[] includes "query-commands").
 
     for chunk in data.chunks(4).take(max_commands) {
         let b0 = chunk[0];
@@ -912,7 +1048,11 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         );
     }
 
-    let mutator = StdScheduledMutator::new(havoc_mutations());
+    let havoc_mutator = StdScheduledMutator::new(havoc_mutations());
+    let chunk_mutator = StdScheduledMutator::new(tuple_list!(
+        ChunkArgMutator::default(),
+        ChunkOpMutator::default(),
+    ));
     let queue_sync_stage = SyncFromDiskStage::with_from_file(paths.queue_root.clone());
     let sync_interval = cfg.sync_interval;
     let mut sync_tick: u64 = 0;
@@ -923,9 +1063,13 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         },
         tuple_list!(queue_sync_stage),
     );
+    // Two mutation passes per fuzz iteration:
+    //   1. chunk-aware mutations (preserve structure, improve signal quality)
+    //   2. havoc mutations (broad byte-level exploration)
     let mut stages = tuple_list!(
         periodic_queue_sync,
-        StdMutationalStage::with_max_iterations(mutator, 1)
+        StdMutationalStage::with_max_iterations(chunk_mutator, 2),
+        StdMutationalStage::with_max_iterations(havoc_mutator, 4)
     );
 
     let (new_crashes_pre, new_timeouts_pre, new_unknowns_pre) =
