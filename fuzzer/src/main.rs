@@ -84,10 +84,10 @@ const HMP_COMMANDS: &[&str] = &[
     "info block",
     "info network",
     "info qom-tree",
-    "info irq",
-    "info cpu",
+    "info version",    // was "info irq" - IRQ counts are non-deterministic (timer fires)
+    "info kvm",        // was "info cpu" - pc=0x value varies with SeaBIOS execution
     "info mem",
-    "info registers",
+    "info lapic",      // was "info registers" - CPU registers vary with SeaBIOS
     "info blockstats",
 ];
 const CHARDEV_BACKENDS: &[&str] = &["null", "memory", "ringbuf"];
@@ -559,8 +559,8 @@ where
         if byte_idx >= bytes.len() {
             return Ok(MutationResult::Skipped);
         }
-        // Write a direct op index so b0 % 16 lands exactly on the chosen op.
-        bytes[byte_idx] = state.rand_mut().below(16) as u8;
+        // Write a direct op index so b0 % 17 lands exactly on the chosen op.
+        bytes[byte_idx] = state.rand_mut().below(17) as u8;
         Ok(MutationResult::Mutated)
     }
 }
@@ -592,7 +592,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
         let b3 = chunk.get(3).copied().unwrap_or(0);
-        let op = b0 % 16;
+        let op = b0 % 17;
 
         match op {
             0 => {
@@ -712,14 +712,26 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                     push_blockdev_del(&mut cmds, &node_name);
                 }
             }
-            _ => {
+            15 => {
                 // Op 15: extended HMP commands that probe CPU / memory state.
+                // "info registers" is excluded: SeaBIOS executes concurrently so CPU
+                // register values differ on every run, making that output non-deterministic.
                 // "info chardev" is excluded: it would expose the dynamic chr{N} IDs
                 // in unquoted form (chr0: filename=...) which the normaliser can't strip.
                 const EXTENDED_HMP: &[&str] =
-                    &["info cpus", "info mem", "info registers", "info blockstats"];
+                    &["info cpus", "info mem", "info blockstats", "info lapic"];
                 let hmp = EXTENDED_HMP[(b1 as usize) % EXTENDED_HMP.len()];
                 push_hmp(&mut cmds, hmp);
+            }
+            _ => {
+                // Op 16: system_reset — sends a hard machine reset via QMP.
+                // Hotplugged devices survive the reset (QEMU keeps them attached),
+                // but the guest (SeaBIOS) restarts from scratch and may re-probe them.
+                // This exercises QEMU's machine reset code paths, which are a known
+                // source of use-after-free and improper re-initialization bugs.
+                // Live resource tracking lists are intentionally kept intact: sending
+                // device_del / object-del after a reset is a valid stress scenario.
+                push_exec(&mut cmds, "system_reset");
             }
         }
     }
@@ -753,7 +765,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 19] = [
+    let seeds: [(&str, &[u8]); 21] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -801,6 +813,13 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         ),
         // op=15: extended HMP (info cpu)
         ("seed-ext-hmp.bin", &[0x0f, 0x00, 0x00, 0x00]),
+        // op=16: system_reset (standalone reset)
+        ("seed-system-reset.bin", &[0x10, 0x00, 0x00, 0x00]),
+        // op=16: device_add then system_reset then device_del (reset-path stress)
+        (
+            "seed-reset-with-device.bin",
+            &[0x02, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
+        ),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;

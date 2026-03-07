@@ -4,3 +4,5 @@ qemu-*.tar.xz
 corpus/
 crashes/
 sync/
+logs/*.log
+logs/*.out
