@@ -58,12 +58,12 @@ const DEVICE_DRIVERS: &[&str] = &[
 const QUERY_COMMANDS: &[&str] = &[
     "query-status",
     "query-version",
-    "query-qmp-schema",
+    "query-pci",
     "query-machines",
     "query-cpus-fast",
     "query-hotpluggable-cpus",
     "query-memory-devices",
-    "query-pci",
+    "query-iothreads",
     "query-target",
     "query-kvm",
     "query-commands",
@@ -206,8 +206,8 @@ fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
     // words like "'device'" that share a prefix with "'dev<NNN>'".
     //   "#netNNN"  – internal netdev counter in `hmp info network` output
     //   "'devNNN'" – device ID echoed back in DeviceNotFound error messages
-    //   "'memNNN'" – object ID echoed back in object-not-found error messages
-    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net", b"'dev", b"'mem"];
+    //   "'objNNN'" – object ID echoed back in object-not-found error messages
+    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net", b"'dev", b"'obj"];
 
     let mut out = Vec::with_capacity(stdout.len());
     let mut i = 0;
@@ -593,7 +593,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 if b3 & 0x1 == 0 {
                     push_exec(&mut cmds, "qom-list-types");
                 } else {
-                    push_exec(&mut cmds, "query-qmp-schema");
+                    push_exec(&mut cmds, "query-memory-size-summary");
                 }
             }
         }
