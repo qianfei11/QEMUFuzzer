@@ -6,3 +6,4 @@ crashes/
 sync/
 logs/*.log
 logs/*.out
+logs/*.pid
