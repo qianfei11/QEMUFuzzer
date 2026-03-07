@@ -34,7 +34,7 @@ use libafl_bolts::{
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_QEMU_BIN: &str = "/usr/bin/qemu-system-x86_64";
-const DEFAULT_MACHINE: &str = "q35";
+const DEFAULT_MACHINE: &str = "pc";
 const DEFAULT_SEED_DIR: &str = "corpus";
 const DEFAULT_CRASH_DIR: &str = "crashes";
 const DEFAULT_SYNC_DIR: &str = "sync";
@@ -44,16 +44,23 @@ const DEFAULT_MAX_COMMANDS: usize = 16;
 const DEFAULT_SYNC_INTERVAL: u64 = 50;
 
 const DEVICE_DRIVERS: &[&str] = &[
+    // PCI NIC drivers – all hotplug-capable on i440fx (pc) machine
     "e1000",
     "rtl8139",
-    "virtio-rng-pci",
-    "edu",
-    "pc-testdev",
+    "ne2k_pci",
+    "pcnet",
     "virtio-net-pci",
-    "virtio-blk-pci",
-    "virtio-balloon-pci",
-    "pvpanic-pci",
+    // Virtio device family
+    "virtio-rng-pci",
     "virtio-serial-pci",
+    "virtio-balloon-pci",
+    // USB input devices (require ich9-usb-uhci1 in base command)
+    "usb-mouse",
+    "usb-kbd",
+    "usb-tablet",
+    // Test/debug devices
+    "pci-testdev",
+    "edu",
 ];
 const QUERY_COMMANDS: &[&str] = &[
     "query-status",
@@ -65,7 +72,8 @@ const QUERY_COMMANDS: &[&str] = &[
     "query-memory-devices",
     "query-iothreads",
     "query-target",
-    "query-kvm",
+    "query-blockdev",
+    "query-chardev",
     "query-commands",
 ];
 const HMP_COMMANDS: &[&str] = &[
@@ -77,7 +85,12 @@ const HMP_COMMANDS: &[&str] = &[
     "info network",
     "info qom-tree",
     "info irq",
+    "info cpu",
+    "info mem",
+    "info registers",
+    "info blockstats",
 ];
+const CHARDEV_BACKENDS: &[&str] = &["null", "memory", "ringbuf"];
 const QOM_PATHS: &[&str] = &[
     "/machine",
     "/machine/peripheral",
@@ -182,8 +195,22 @@ where
 
     fn observe_stdout(&mut self, stdout: &[u8]) {
         let normalized = normalize_qemu_stdout(stdout);
+        // Sort response lines before hashing so that the same set of QMP responses
+        // hashes identically regardless of the order in which commands were issued.
+        // This collapses the huge space of permutations (a major driver of corpus
+        // bloat) while still distinguishing inputs that trigger different response sets.
+        let mut lines: Vec<&[u8]> = normalized
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.sort_unstable();
+        let mut sorted = Vec::with_capacity(normalized.len() + lines.len());
+        for line in &lines {
+            sorted.extend_from_slice(line);
+            sorted.push(b'\n');
+        }
         let mut hasher = DefaultHasher::new();
-        normalized.hash(&mut hasher);
+        sorted.hash(&mut hasher);
         self.hash = Some(hasher.finish());
     }
 }
@@ -204,10 +231,12 @@ fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
     // Patterns that must be immediately followed by at least one digit (no separator).
     // Only normalised when a digit is actually present, preventing false matches on
     // words like "'device'" that share a prefix with "'dev<NNN>'".
-    //   "#netNNN"  – internal netdev counter in `hmp info network` output
-    //   "'devNNN'" – device ID echoed back in DeviceNotFound error messages
-    //   "'objNNN'" – object ID echoed back in object-not-found error messages
-    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net", b"'dev", b"'obj"];
+    //   "#netNNN"   – internal netdev counter in `hmp info network` output
+    //   "'devNNN'"  – device ID echoed back in DeviceNotFound error messages
+    //   "'objNNN'"  – object ID echoed back in object-not-found error messages
+    //   "'hnetNNN'" – hotplugged netdev ID in DeviceNotFound errors
+    //   "thread_id=" – CPU thread ID from `hmp info cpus`, varies per QEMU process
+    const DIRECT_PATTERNS: &[&[u8]] = &[b"#net", b"'dev", b"'obj", b"'hnet", b"'chr", b"='blk", b"thread_id="];
 
     let mut out = Vec::with_capacity(stdout.len());
     let mut i = 0;
@@ -268,6 +297,9 @@ fn build_base_qemu_command(qemu_bin: &Path, machine: &str, debug: bool) -> Comma
         .arg("none")
         // Prevent QEMU from looping on guest reboot/reset events; it must exit instead.
         .arg("-no-reboot")
+        // USB controller: required for usb-mouse, usb-kbd, usb-tablet hotplug.
+        .arg("-device")
+        .arg("ich9-usb-uhci1,id=usb0")
         .arg("-qmp")
         .arg("stdio")
         .stdin(Stdio::piped());
@@ -408,6 +440,44 @@ fn push_device_list_properties(cmds: &mut String, driver: &str) {
     cmds.push_str("\"}}\n");
 }
 
+fn push_netdev_add(cmds: &mut String, id: &str) {
+    cmds.push_str("{\"execute\":\"netdev_add\",\"arguments\":{\"type\":\"user\",\"id\":\"");
+    cmds.push_str(id);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_netdev_del(cmds: &mut String, id: &str) {
+    cmds.push_str("{\"execute\":\"netdev_del\",\"arguments\":{\"id\":\"");
+    cmds.push_str(id);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_chardev_add(cmds: &mut String, backend: &str, id: &str) {
+    cmds.push_str("{\"execute\":\"chardev-add\",\"arguments\":{\"id\":\"");
+    cmds.push_str(id);
+    cmds.push_str("\",\"backend\":{\"type\":\"");
+    cmds.push_str(backend);
+    cmds.push_str("\",\"data\":{}}}}\n");
+}
+
+fn push_chardev_remove(cmds: &mut String, id: &str) {
+    cmds.push_str("{\"execute\":\"chardev-remove\",\"arguments\":{\"id\":\"");
+    cmds.push_str(id);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_blockdev_add(cmds: &mut String, node_name: &str) {
+    cmds.push_str("{\"execute\":\"blockdev-add\",\"arguments\":{\"driver\":\"null-co\",\"node-name\":\"");
+    cmds.push_str(node_name);
+    cmds.push_str("\"}}\n");
+}
+
+fn push_blockdev_del(cmds: &mut String, node_name: &str) {
+    cmds.push_str("{\"execute\":\"blockdev-del\",\"arguments\":{\"node-name\":\"");
+    cmds.push_str(node_name);
+    cmds.push_str("\"}}\n");
+}
+
 // ── Chunk-aware mutators ──────────────────────────────────────────────────────
 //
 // The fuzzer input is a sequence of 4-byte chunks:
@@ -489,8 +559,8 @@ where
         if byte_idx >= bytes.len() {
             return Ok(MutationResult::Skipped);
         }
-        // Write a direct op index so b0 % 12 lands exactly on the chosen op.
-        bytes[byte_idx] = state.rand_mut().below(12) as u8;
+        // Write a direct op index so b0 % 16 lands exactly on the chosen op.
+        bytes[byte_idx] = state.rand_mut().below(16) as u8;
         Ok(MutationResult::Mutated)
     }
 }
@@ -499,8 +569,14 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut cmds = String::with_capacity(1024);
     let mut next_device_id: u64 = 0;
     let mut next_object_id: u64 = 0;
+    let mut next_netdev_id: u64 = 0;
+    let mut next_chardev_id: u64 = 0;
+    let mut next_blockdev_id: u64 = 0;
     let mut live_devices: Vec<String> = Vec::new();
     let mut live_objects: Vec<String> = Vec::new();
+    let mut live_netdevs: Vec<String> = Vec::new();
+    let mut live_chardevs: Vec<String> = Vec::new();
+    let mut live_blockdevs: Vec<String> = Vec::new();
     // Track whether the VM is currently paused so we only send `cont` in
     // cleanup when actually needed.  Sending `cont` to a running VM returns
     // an error response that pollutes the stdout hash and inflates the corpus.
@@ -516,7 +592,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
         let b3 = chunk.get(3).copied().unwrap_or(0);
-        let op = b0 % 12;
+        let op = b0 % 16;
 
         match op {
             0 => {
@@ -589,12 +665,61 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 let driver = DEVICE_DRIVERS[(b1 as usize) % DEVICE_DRIVERS.len()];
                 push_device_list_properties(&mut cmds, driver);
             }
-            _ => {
+            11 => {
                 if b3 & 0x1 == 0 {
                     push_exec(&mut cmds, "qom-list-types");
                 } else {
                     push_exec(&mut cmds, "query-memory-size-summary");
                 }
+            }
+            12 => {
+                // netdev_add (user-mode) or netdev_del if live netdevs exist.
+                if b1 & 0x1 == 0 || live_netdevs.is_empty() {
+                    let id = format!("hnet{next_netdev_id}");
+                    next_netdev_id += 1;
+                    push_netdev_add(&mut cmds, &id);
+                    live_netdevs.push(id);
+                } else {
+                    let pick = (b2 as usize) % live_netdevs.len();
+                    let id = live_netdevs.swap_remove(pick);
+                    push_netdev_del(&mut cmds, &id);
+                }
+            }
+            13 => {
+                // chardev-add or chardev-remove if live chardevs exist.
+                if b1 & 0x1 == 0 || live_chardevs.is_empty() {
+                    let backend = CHARDEV_BACKENDS[(b2 as usize) % CHARDEV_BACKENDS.len()];
+                    let id = format!("chr{next_chardev_id}");
+                    next_chardev_id += 1;
+                    push_chardev_add(&mut cmds, backend, &id);
+                    live_chardevs.push(id);
+                } else {
+                    let pick = (b2 as usize) % live_chardevs.len();
+                    let id = live_chardevs.swap_remove(pick);
+                    push_chardev_remove(&mut cmds, &id);
+                }
+            }
+            14 => {
+                // blockdev-add (null-co) or blockdev-del if live blockdevs exist.
+                if b1 & 0x1 == 0 || live_blockdevs.is_empty() {
+                    let node_name = format!("blk{next_blockdev_id}");
+                    next_blockdev_id += 1;
+                    push_blockdev_add(&mut cmds, &node_name);
+                    live_blockdevs.push(node_name);
+                } else {
+                    let pick = (b2 as usize) % live_blockdevs.len();
+                    let node_name = live_blockdevs.swap_remove(pick);
+                    push_blockdev_del(&mut cmds, &node_name);
+                }
+            }
+            _ => {
+                // Op 15: extended HMP commands that probe CPU / memory state.
+                // "info chardev" is excluded: it would expose the dynamic chr{N} IDs
+                // in unquoted form (chr0: filename=...) which the normaliser can't strip.
+                const EXTENDED_HMP: &[&str] =
+                    &["info cpus", "info mem", "info registers", "info blockstats"];
+                let hmp = EXTENDED_HMP[(b1 as usize) % EXTENDED_HMP.len()];
+                push_hmp(&mut cmds, hmp);
             }
         }
     }
@@ -609,6 +734,15 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     for id in &live_objects {
         push_object_del(&mut cmds, id);
     }
+    for id in &live_netdevs {
+        push_netdev_del(&mut cmds, id);
+    }
+    for id in &live_chardevs {
+        push_chardev_remove(&mut cmds, id);
+    }
+    for node_name in &live_blockdevs {
+        push_blockdev_del(&mut cmds, node_name);
+    }
     push_exec(&mut cmds, "quit");
     cmds.into_bytes()
 }
@@ -619,14 +753,14 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 12] = [
+    let seeds: [(&str, &[u8]); 19] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
         (
             // chunk-1: op=2 (device_add, driver=e1000, id=dev0)
             // chunk-2: op=3 (device_del, pick=0 → dev0)
-            // Exercises the in-loop device_del path (op=3).
+            // Exercises the in-loop device_del path (op=3) — now actually succeeds on pc.
             "seed-device-cycle.bin",
             &[0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
         ),
@@ -644,6 +778,29 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         ),
         ("seed-list-properties.bin", &[0x0a, 0x00, 0x00, 0x00]),
         ("seed-qom-types.bin", &[0x0b, 0x00, 0x00, 0x00]),
+        // op=12: netdev_add (user)
+        ("seed-netdev-add.bin", &[0x0c, 0x00, 0x00, 0x00]),
+        // op=12 add then del: hnet0 add (b1=0→add) then hnet0 del (b1=1→del, b2=0→pick 0)
+        (
+            "seed-netdev-cycle.bin",
+            &[0x0c, 0x00, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00],
+        ),
+        // op=13: chardev-add null
+        ("seed-chardev-add.bin", &[0x0d, 0x00, 0x00, 0x00]),
+        // op=13 cycle: chardev null add then remove
+        (
+            "seed-chardev-cycle.bin",
+            &[0x0d, 0x00, 0x00, 0x00, 0x0d, 0x01, 0x00, 0x00],
+        ),
+        // op=14: blockdev-add null-co
+        ("seed-blockdev-add.bin", &[0x0e, 0x00, 0x00, 0x00]),
+        // op=14 cycle: blockdev add then del
+        (
+            "seed-blockdev-cycle.bin",
+            &[0x0e, 0x00, 0x00, 0x00, 0x0e, 0x01, 0x00, 0x00],
+        ),
+        // op=15: extended HMP (info cpu)
+        ("seed-ext-hmp.bin", &[0x0f, 0x00, 0x00, 0x00]),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
