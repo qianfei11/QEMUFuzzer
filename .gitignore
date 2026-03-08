@@ -7,3 +7,6 @@ sync/
 logs/*.log
 logs/*.out
 logs/*.pid
+qemu-asan/
+crashes-asan/
+wget-log

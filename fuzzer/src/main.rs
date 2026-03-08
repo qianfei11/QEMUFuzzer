@@ -102,6 +102,29 @@ const QOM_PROPERTIES: &[&str] = &["type", "id", "realized", "hotplugged", "drive
 const CMDLINE_OPTIONS: &[&str] = &["device", "machine", "cpu", "accel", "netdev"];
 const OBJECT_TYPES: &[&str] = &["rng-random", "iothread", "memory-backend-ram"];
 
+// Op 18: balloon target sizes in MB (powers-of-two, 32 MB … 4 GB)
+const BALLOON_SIZES_MB: &[u64] = &[32, 64, 128, 256, 512, 1024, 2048, 4096];
+// Op 21: set-action — controls QEMU response to VM lifecycle events
+const SHUTDOWN_ACTIONS: &[&str] = &["poweroff", "pause", "shutdown", "ignore"];
+const REBOOT_ACTIONS:   &[&str] = &["reset",    "shutdown", "ignore"];
+const PANIC_ACTIONS:    &[&str] = &["pause",    "shutdown", "none"];
+// Op 22: migrate-set-parameters — key/value pairs to fuzz the migration engine
+const MIGRATE_PARAMS: &[(&str, &str)] = &[
+    ("max-bandwidth",          "0"),
+    ("max-bandwidth",          "1073741824"),
+    ("downtime-limit",         "300"),
+    ("downtime-limit",         "0"),
+    ("cpu-throttle-initial",   "20"),
+    ("xbzrle-cache-size",      "67108864"),
+    ("multifd-channels",       "1"),
+    ("multifd-channels",       "255"),
+];
+// Op 23: migrate-set-capabilities flags (all combinable, bool state)
+const MIGRATE_CAPS: &[&str] = &[
+    "xbzrle", "rdma-pin-all", "auto-converge", "zero-blocks",
+    "compress", "events", "postcopy-ram", "x-colo",
+];
+
 #[derive(Debug, Clone)]
 struct Config {
     qemu_bin: PathBuf,
@@ -573,6 +596,53 @@ fn push_blockdev_del(cmds: &mut String, node_name: &str) {
     cmds.push_str("\"}}\n");
 }
 
+// Op 18: memory balloon – request the guest to surrender/claim memory.
+// Requires virtio-balloon-pci device; without it QEMU returns GenericError.
+fn push_balloon(cmds: &mut String, value_mb: u64) {
+    let value_bytes = value_mb.saturating_mul(1024 * 1024);
+    cmds.push_str("{\"execute\":\"balloon\",\"arguments\":{\"value\":");
+    cmds.push_str(&value_bytes.to_string());
+    cmds.push_str("}}\n");
+}
+
+// Op 21: set-action – configure QEMU's response to VM lifecycle events.
+// Setting "shutdown":"ignore" keeps QEMU alive after a guest poweroff attempt,
+// "pause" leaves the VM paused instead of exiting.  Interesting because it
+// changes the state machine that device hotplug and reset interact with.
+fn push_set_action(cmds: &mut String, shutdown: &str, reboot: &str, panic: &str) {
+    cmds.push_str("{\"execute\":\"set-action\",\"arguments\":{\"shutdown\":\"");
+    cmds.push_str(shutdown);
+    cmds.push_str("\",\"reboot\":\"");
+    cmds.push_str(reboot);
+    cmds.push_str("\",\"panic\":\"");
+    cmds.push_str(panic);
+    cmds.push_str("\"}}\n");
+}
+
+// Op 22: migrate-set-parameters – fuzz the live-migration engine configuration.
+// Many parameters interact with memory/bandwidth limits; extreme values (0, MAX)
+// can expose integer overflow and unchecked-arithmetic bugs in migration code.
+fn push_migrate_set_parameters(cmds: &mut String, key: &str, value: &str) {
+    cmds.push_str("{\"execute\":\"migrate-set-parameters\",\"arguments\":{\"");
+    cmds.push_str(key);
+    cmds.push_str("\":");
+    cmds.push_str(value);
+    cmds.push_str("}}\n");
+}
+
+// Op 23: migrate-set-capabilities – toggle individual migration capability flags.
+fn push_migrate_set_capabilities(cmds: &mut String, cap: &str, state: bool) {
+    cmds.push_str(
+        "{\"execute\":\"migrate-set-capabilities\",\"arguments\":{\"capabilities\":[{\"capability\":\"",
+    );
+    cmds.push_str(cap);
+    cmds.push_str(if state {
+        "\",\"state\":true}]}}\n"
+    } else {
+        "\",\"state\":false}]}}\n"
+    });
+}
+
 // ── Chunk-aware mutators ──────────────────────────────────────────────────────
 //
 // The fuzzer input is a sequence of 4-byte chunks:
@@ -654,8 +724,8 @@ where
         if byte_idx >= bytes.len() {
             return Ok(MutationResult::Skipped);
         }
-        // Write a direct op index so b0 % 17 lands exactly on the chosen op.
-        bytes[byte_idx] = state.rand_mut().below(18) as u8;
+        // Write a direct op index so b0 % 24 lands exactly on the chosen op.
+        bytes[byte_idx] = state.rand_mut().below(24) as u8;
         Ok(MutationResult::Mutated)
     }
 }
@@ -828,7 +898,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 // device_del / object-del after a reset is a valid stress scenario.
                 push_exec(&mut cmds, "system_reset");
             }
-            _ => {
+            17 => {
                 // Op 17: qom-set — write a value to a QOM property.
                 // Most properties are read-only → E:GenericError, but writable
                 // properties (e.g., balloon target, virtio queues, memory sizes)
@@ -843,6 +913,58 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 let property = QOM_PROPERTIES[(b2 as usize) % QOM_PROPERTIES.len()];
                 let value = QOM_SET_VALUES[(b3 as usize) % QOM_SET_VALUES.len()];
                 push_qom_set(&mut cmds, path, property, value);
+            }
+            18 => {
+                // Op 18: balloon / query-balloon — exercise the memory balloon driver.
+                // balloon changes the guest-visible RAM target (requires virtio-balloon-pci).
+                // Without the device QEMU returns GenericError (still exercises that path).
+                // Extreme values (0, 4 GB) stress balloon-driver arithmetic.
+                if b3 & 1 == 0 {
+                    let size_mb = BALLOON_SIZES_MB[(b1 as usize) % BALLOON_SIZES_MB.len()];
+                    push_balloon(&mut cmds, size_mb);
+                } else {
+                    push_exec(&mut cmds, "query-balloon");
+                }
+            }
+            19 => {
+                // Op 19: system_powerdown — sends ACPI power-button press to the guest.
+                // Without an OS/ACPI-handler the guest ignores it; QEMU stays running.
+                // Combined with device hotplug this exercises the ACPI interrupt delivery
+                // path in QEMU's piix4-pm and ich9 device models.
+                push_exec(&mut cmds, "system_powerdown");
+            }
+            20 => {
+                // Op 20: inject-nmi — delivers a Non-Maskable Interrupt to all vCPUs.
+                // The guest (SeaBIOS or bare metal) may triple-fault → system reset.
+                // With -no-reboot that causes QEMU to exit; without a guest OS the
+                // NMI is often silently swallowed by the hardware emulation.
+                push_exec(&mut cmds, "inject-nmi");
+            }
+            21 => {
+                // Op 21: set-action — configures what QEMU does on VM lifecycle events.
+                // Interesting combinations: "shutdown":"ignore" keeps QEMU alive after
+                // a guest poweroff (interacts with system_powerdown / system_reset),
+                // "reboot":"shutdown" converts resets into exits.
+                let shutdown = SHUTDOWN_ACTIONS[(b1 as usize) % SHUTDOWN_ACTIONS.len()];
+                let reboot   = REBOOT_ACTIONS  [(b2 as usize) % REBOOT_ACTIONS.len()];
+                let panic    = PANIC_ACTIONS   [(b3 as usize) % PANIC_ACTIONS.len()];
+                push_set_action(&mut cmds, shutdown, reboot, panic);
+            }
+            22 => {
+                // Op 22: migrate-set-parameters — fuzz live-migration engine config.
+                // Extreme values (0, UINT64_MAX) can expose integer-overflow and
+                // unvalidated-input bugs in migration parameter handling code.
+                let (key, val) = MIGRATE_PARAMS[(b1 as usize) % MIGRATE_PARAMS.len()];
+                push_migrate_set_parameters(&mut cmds, key, val);
+            }
+            _ => {
+                // Op 23: migrate-set-capabilities — toggle individual migration flags.
+                // Many capability combinations are not well tested; enabling rdma-pin-all
+                // without RDMA hardware, or combining postcopy-ram + compression, can
+                // expose assertion failures in capability negotiation code.
+                let cap   = MIGRATE_CAPS[(b1 as usize) % MIGRATE_CAPS.len()];
+                let state = b2 & 1 == 0;
+                push_migrate_set_capabilities(&mut cmds, cap, state);
             }
         }
     }
@@ -876,7 +998,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 23] = [
+    let seeds: [(&str, &[u8]); 30] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -922,7 +1044,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
             "seed-blockdev-cycle.bin",
             &[0x0e, 0x00, 0x00, 0x00, 0x0e, 0x01, 0x00, 0x00],
         ),
-        // op=15: extended HMP (info cpu)
+        // op=15: extended HMP (info cpus)
         ("seed-ext-hmp.bin", &[0x0f, 0x00, 0x00, 0x00]),
         // op=16: system_reset (standalone reset)
         ("seed-system-reset.bin", &[0x10, 0x00, 0x00, 0x00]),
@@ -931,11 +1053,25 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
             "seed-reset-with-device.bin",
             &[0x02, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
         ),
-        // op=17: qom-set /machine.realized=true (most common writable bool property)
-        // b0=0x11(17), b1=0x00(/machine), b2=0x02(realized), b3=0x00(true)
+        // op=17: qom-set /machine realized=true  b0=17 b1=0(/machine) b2=2(realized) b3=0(true)
         ("seed-qom-set.bin", &[0x11, 0x00, 0x02, 0x00]),
-        // op=17: qom-set with int value (b3=0x04 → "0")
+        // op=17: qom-set with int value 0
         ("seed-qom-set-int.bin", &[0x11, 0x00, 0x00, 0x04]),
+        // op=18: balloon 64MB  b0=18 b1=1(64MB) b3=0(set not query)
+        ("seed-balloon.bin", &[0x12, 0x01, 0x00, 0x00]),
+        // op=18: query-balloon  b3=1 → query path
+        ("seed-query-balloon.bin", &[0x12, 0x00, 0x00, 0x01]),
+        // op=19: system_powerdown
+        ("seed-powerdown.bin", &[0x13, 0x00, 0x00, 0x00]),
+        // op=20: inject-nmi
+        ("seed-inject-nmi.bin", &[0x14, 0x00, 0x00, 0x00]),
+        // op=21: set-action shutdown=pause,reboot=reset,panic=none
+        // b0=21(0x15) b1=1(pause) b2=0(reset) b3=2(none)
+        ("seed-set-action.bin", &[0x15, 0x01, 0x00, 0x02]),
+        // op=22: migrate-set-parameters max-bandwidth=0  b0=22(0x16) b1=0
+        ("seed-migrate-params.bin", &[0x16, 0x00, 0x00, 0x00]),
+        // op=23: migrate-set-capabilities xbzrle=false  b0=23(0x17) b1=0 b2=1(false)
+        ("seed-migrate-caps.bin", &[0x17, 0x00, 0x01, 0x00]),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
