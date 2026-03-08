@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$(realpath "$0")")"
 BIN=./target/release/fuzzer
 LOG_DIR=./logs
 SYNC_DIR=./sync
