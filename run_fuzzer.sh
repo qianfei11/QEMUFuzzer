@@ -19,7 +19,7 @@ while true; do
     --qemu-bin /usr/bin/qemu-system-x86_64 \
     --machine pc \
     --iterations 200000 \
-    --timeout-ms 2000 \
+    --timeout-ms 4000 \
     --max-commands 24 \
     --jobs 8 \
     --seed-dir ./corpus \
