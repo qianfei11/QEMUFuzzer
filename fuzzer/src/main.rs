@@ -194,25 +194,106 @@ where
     }
 
     fn observe_stdout(&mut self, stdout: &[u8]) {
-        let normalized = normalize_qemu_stdout(stdout);
-        // Sort response lines before hashing so that the same set of QMP responses
-        // hashes identically regardless of the order in which commands were issued.
-        // This collapses the huge space of permutations (a major driver of corpus
-        // bloat) while still distinguishing inputs that trigger different response sets.
-        let mut lines: Vec<&[u8]> = normalized
-            .split(|&b| b == b'\n')
-            .filter(|l| !l.is_empty())
-            .collect();
-        lines.sort_unstable();
-        let mut sorted = Vec::with_capacity(normalized.len() + lines.len());
-        for line in &lines {
-            sorted.extend_from_slice(line);
-            sorted.push(b'\n');
+        // Coarse structural hash: instead of hashing full normalised response content
+        // (which produces a near-unique hash for every distinct input because even minor
+        // argument differences yield different JSON — causing 10M+ corpus entries in 24h),
+        // we reduce each response line to a short type-token:
+        //
+        //   R0  – {"return": {}} or {"return": []}   empty success
+        //   RA  – {"return": [...]                   array success
+        //   RO  – {"return": {...}                   object success
+        //   RS  – {"return": "..."                   string (HMP) success
+        //   RN  – {"return": null}
+        //   E:X – {"error": {"class": "X", ...}}     error, class X
+        //   V:X – {... "event": "X" ...}             async event X
+        //
+        // The sorted multiset of these tokens is hashed. This caps the distinct-hash space
+        // to roughly O(N^K) where N≈10 token types and K = command count, yielding a
+        // practical corpus of ~10K–50K instead of 10M+. The tokens are order-independent
+        // (sorted) and content-independent (only shape matters), making the hash fully
+        // deterministic even for commands with non-deterministic response content such as
+        // query-cpus-fast (thread-id) or info mtree (address space ordering).
+        let mut tokens: Vec<&'static str> = Vec::with_capacity(32);
+        for line in stdout.split(|&b| b == b'\n') {
+            if line.is_empty() || line.starts_with(b"{\"QMP\"") {
+                continue;
+            }
+            let tok = qmp_response_token(line);
+            if !tok.is_empty() {
+                tokens.push(tok);
+            }
         }
+        tokens.sort_unstable();
         let mut hasher = DefaultHasher::new();
-        sorted.hash(&mut hasher);
+        tokens.hash(&mut hasher);
         self.hash = Some(hasher.finish());
     }
+}
+
+/// Classify one QMP output line into a short stable token used for corpus deduplication.
+///
+/// Returning a `&'static str` for the common cases avoids allocation in the hot path.
+/// Caller must handle the owned `String` variants (E: and V: prefixes) separately if
+/// distinct error/event classes are needed — but since we use a sorted token list that is
+/// immediately hashed, we store interned literals for the known classes and fall back to
+/// a fixed token for unknowns to keep this function allocation-free.
+fn qmp_response_token(line: &[u8]) -> &'static str {
+    // Success responses
+    if line.starts_with(b"{\"return\":") || line.starts_with(b"{\"return\": ") {
+        let val_start = if let Some(p) = find_bytes(line, b": ") { p + 2 } else { 10 };
+        let rest = &line[val_start.min(line.len())..];
+        if rest.starts_with(b"{}") || rest.starts_with(b"{ }") || rest.starts_with(b"[]}") {
+            return "R0";
+        }
+        if rest.starts_with(b"[]") {
+            return "R0";  // empty array ≡ empty return for our purposes
+        }
+        if rest.starts_with(b"[") {
+            return "RA";
+        }
+        if rest.starts_with(b"\"") {
+            return "RS";
+        }
+        if rest.starts_with(b"null") {
+            return "RN";
+        }
+        if rest.starts_with(b"true") || rest.starts_with(b"false") {
+            return "RB";
+        }
+        if rest.starts_with(b"{") {
+            return "RO";
+        }
+        return "R?";
+    }
+
+    // Error responses – classify by error class for fine-grained guidance
+    if find_bytes(line, b"\"class\":\"").is_some() {
+        if find_bytes(line, b"DeviceNotFound").is_some() { return "E:DeviceNotFound"; }
+        if find_bytes(line, b"GenericError").is_some()   { return "E:GenericError"; }
+        if find_bytes(line, b"CommandNotFound").is_some(){ return "E:CommandNotFound"; }
+        if find_bytes(line, b"KVMMissingCap").is_some()  { return "E:KVMMissingCap"; }
+        return "E:Other";
+    }
+
+    // Async events – classify by event name
+    if find_bytes(line, b"\"event\":\"").is_some() {
+        if find_bytes(line, b"SHUTDOWN").is_some()        { return "V:SHUTDOWN"; }
+        if find_bytes(line, b"RESET").is_some()           { return "V:RESET"; }
+        if find_bytes(line, b"DEVICE_DELETED").is_some()  { return "V:DEVICE_DELETED"; }
+        if find_bytes(line, b"SUSPEND").is_some()         { return "V:SUSPEND"; }
+        if find_bytes(line, b"WAKEUP").is_some()          { return "V:WAKEUP"; }
+        return "V:Other";
+    }
+
+    ""
+}
+
+/// Return the byte offset of the first occurrence of `needle` in `haystack`, or `None`.
+#[inline]
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
 }
 
 /// Strips the non-deterministic numeric values from QEMU QMP timestamp fields so
@@ -226,7 +307,7 @@ where
 fn normalize_qemu_stdout(stdout: &[u8]) -> Vec<u8> {
     // Patterns followed by optional whitespace then a digit sequence.
     // Used for JSON timestamp fields: "seconds": 12345 → "seconds": 0
-    const SPACED_PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":"];
+    const SPACED_PATTERNS: &[&[u8]] = &[b"\"seconds\":", b"\"microseconds\":", b"\"thread-id\":"];
 
     // Patterns that must be immediately followed by at least one digit (no separator).
     // Only normalised when a digit is actually present, preventing false matches on
@@ -428,6 +509,20 @@ fn push_qom_get(cmds: &mut String, path: &str, property: &str) {
     cmds.push_str("\"}}\n");
 }
 
+/// qom-set: write a value to a writable QOM property.
+/// Most "set" attempts will return GenericError (read-only or wrong type), but
+/// writable numeric/bool/string properties can trigger deep property-setter code
+/// paths that are not exercised by read-only fuzzing.
+fn push_qom_set(cmds: &mut String, path: &str, property: &str, value: &str) {
+    cmds.push_str("{\"execute\":\"qom-set\",\"arguments\":{\"path\":\"");
+    cmds.push_str(path);
+    cmds.push_str("\",\"property\":\"");
+    cmds.push_str(property);
+    cmds.push_str("\",\"value\":");
+    cmds.push_str(value);
+    cmds.push_str("}}\n");
+}
+
 fn push_query_cmdline_options(cmds: &mut String, option: &str) {
     cmds.push_str("{\"execute\":\"query-command-line-options\",\"arguments\":{\"option\":\"");
     cmds.push_str(option);
@@ -560,7 +655,7 @@ where
             return Ok(MutationResult::Skipped);
         }
         // Write a direct op index so b0 % 17 lands exactly on the chosen op.
-        bytes[byte_idx] = state.rand_mut().below(17) as u8;
+        bytes[byte_idx] = state.rand_mut().below(18) as u8;
         Ok(MutationResult::Mutated)
     }
 }
@@ -592,7 +687,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
         let b3 = chunk.get(3).copied().unwrap_or(0);
-        let op = b0 % 17;
+        let op = b0 % 18;
 
         match op {
             0 => {
@@ -723,7 +818,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 let hmp = EXTENDED_HMP[(b1 as usize) % EXTENDED_HMP.len()];
                 push_hmp(&mut cmds, hmp);
             }
-            _ => {
+            16 => {
                 // Op 16: system_reset — sends a hard machine reset via QMP.
                 // Hotplugged devices survive the reset (QEMU keeps them attached),
                 // but the guest (SeaBIOS) restarts from scratch and may re-probe them.
@@ -732,6 +827,22 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 // Live resource tracking lists are intentionally kept intact: sending
                 // device_del / object-del after a reset is a valid stress scenario.
                 push_exec(&mut cmds, "system_reset");
+            }
+            _ => {
+                // Op 17: qom-set — write a value to a QOM property.
+                // Most properties are read-only → E:GenericError, but writable
+                // properties (e.g., balloon target, virtio queues, memory sizes)
+                // invoke property-setter code paths with minimal test coverage.
+                // Fuzzing setter inputs (bool/int/string) can expose type confusion
+                // and boundary errors in QEMU device models.
+                const QOM_SET_VALUES: &[&str] = &[
+                    "true", "false", "0", "1", "255", "65535", "4294967295",
+                    "\"\"", "\"x\"", "null",
+                ];
+                let path = QOM_PATHS[(b1 as usize) % QOM_PATHS.len()];
+                let property = QOM_PROPERTIES[(b2 as usize) % QOM_PROPERTIES.len()];
+                let value = QOM_SET_VALUES[(b3 as usize) % QOM_SET_VALUES.len()];
+                push_qom_set(&mut cmds, path, property, value);
             }
         }
     }
@@ -765,7 +876,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 21] = [
+    let seeds: [(&str, &[u8]); 23] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -820,6 +931,11 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
             "seed-reset-with-device.bin",
             &[0x02, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00],
         ),
+        // op=17: qom-set /machine.realized=true (most common writable bool property)
+        // b0=0x11(17), b1=0x00(/machine), b2=0x02(realized), b3=0x00(true)
+        ("seed-qom-set.bin", &[0x11, 0x00, 0x02, 0x00]),
+        // op=17: qom-set with int value (b3=0x04 → "0")
+        ("seed-qom-set-int.bin", &[0x11, 0x00, 0x00, 0x04]),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
