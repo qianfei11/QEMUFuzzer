@@ -730,6 +730,63 @@ where
     }
 }
 
+/// Trims the input to a random multiple of 4 bytes no longer than `max_commands * 4`.
+///
+/// AFL/LibAFL havoc mutators (splice, crossover) produce ever-growing inputs over time.
+/// Bytes past `max_commands * 4` are silently ignored during execution, so long inputs
+/// generate the same response as their prefix — but they get stored as distinct corpus
+/// entries (different bytes → different de-dup key). This mutator fights corpus bloat by
+/// periodically shrinking inputs back to an effective length.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ChunkTrimMutator {
+    max_commands: usize,
+}
+
+impl ChunkTrimMutator {
+    fn new(max_commands: usize) -> Self {
+        Self { max_commands }
+    }
+}
+
+impl Named for ChunkTrimMutator {
+    fn name(&self) -> &str {
+        "ChunkTrimMutator"
+    }
+}
+
+impl<I, S> Mutator<I, S> for ChunkTrimMutator
+where
+    I: HasBytesVec,
+    S: HasRand,
+{
+    fn mutate(
+        &mut self,
+        state: &mut S,
+        input: &mut I,
+        _stage_idx: i32,
+    ) -> Result<MutationResult, Error> {
+        let bytes = input.bytes_mut();
+        let max_bytes = self.max_commands * 4;
+        // Only act if the input exceeds the useful cap, or stochastically (10% chance)
+        // shrink to a shorter valid prefix to encourage focused short sequences.
+        let do_trim = bytes.len() > max_bytes
+            || (bytes.len() > 4 && state.rand_mut().below(10) == 0);
+        if !do_trim {
+            return Ok(MutationResult::Skipped);
+        }
+        // Choose a new length: a random multiple of 4 in [4, effective_max].
+        let effective_max = bytes.len().min(max_bytes);
+        let num_chunks = (effective_max / 4).max(1);
+        let new_chunks = 1 + state.rand_mut().below(num_chunks as u64) as usize;
+        let new_len = new_chunks * 4;
+        if new_len >= bytes.len() {
+            return Ok(MutationResult::Skipped);
+        }
+        bytes.truncate(new_len);
+        Ok(MutationResult::Mutated)
+    }
+}
+
 fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     let mut cmds = String::with_capacity(1024);
     let mut next_device_id: u64 = 0;
@@ -757,7 +814,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
         let b3 = chunk.get(3).copied().unwrap_or(0);
-        let op = b0 % 18;
+        let op = b0 % 24;
 
         match op {
             0 => {
@@ -998,7 +1055,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 30] = [
+    let seeds: [(&str, &[u8]); 35] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -1072,6 +1129,65 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         ("seed-migrate-params.bin", &[0x16, 0x00, 0x00, 0x00]),
         // op=23: migrate-set-capabilities xbzrle=false  b0=23(0x17) b1=0 b2=1(false)
         ("seed-migrate-caps.bin", &[0x17, 0x00, 0x01, 0x00]),
+        // Scenario: device_add → qom-get → stop → system_reset → device_del
+        // Tests the full device lifecycle across a machine reset (UAF / re-init bugs).
+        (
+            "seed-scenario-reset-uaf.bin",
+            &[
+                0x02, 0x00, 0x00, 0x00, // op=2:  device_add(e1000, dev0)
+                0x08, 0x00, 0x01, 0x00, // op=8:  qom-get(/machine, power0)
+                0x09, 0x00, 0x01, 0x00, // op=9:  stop + query-status
+                0x10, 0x00, 0x00, 0x00, // op=16: system_reset
+                0x03, 0x00, 0x00, 0x00, // op=3:  device_del(dev0) — post-reset
+            ],
+        ),
+        // Scenario: set-action(shutdown=ignore) → system_powerdown → inject-nmi
+        // Tests ACPI + NMI delivery with custom shutdown policy (shutdown must be ignored
+        // so QEMU stays alive after system_powerdown, allowing inject-nmi to follow).
+        (
+            "seed-scenario-acpi-nmi.bin",
+            &[
+                0x15, 0x00, 0x00, 0x00, // op=21: set-action(shutdown=poweroff,reboot=reset,panic=shutdown)
+                0x13, 0x00, 0x00, 0x00, // op=19: system_powerdown
+                0x14, 0x00, 0x00, 0x00, // op=20: inject-nmi
+            ],
+        ),
+        // Scenario: multiple device_add → system_reset → device_del all
+        // Tests bulk device state cleanup after reset.  Variant with 3 different drivers.
+        (
+            "seed-scenario-multi-device-reset.bin",
+            &[
+                0x02, 0x00, 0x00, 0x00, // op=2: device_add(e1000)
+                0x02, 0x03, 0x00, 0x00, // op=2: device_add(rtl8139)
+                0x02, 0x06, 0x00, 0x00, // op=2: device_add(virtio-net-pci)
+                0x10, 0x00, 0x00, 0x00, // op=16: system_reset
+                0x03, 0x00, 0x00, 0x00, // op=3:  device_del(0)
+                0x03, 0x00, 0x00, 0x00, // op=3:  device_del(1)
+                0x03, 0x00, 0x00, 0x00, // op=3:  device_del(2)
+            ],
+        ),
+        // Scenario: migrate-set-parameters + migrate-set-capabilities + query-migrate
+        // Tests migration engine config paths.  query-migrate returns "completed"/"idle".
+        (
+            "seed-scenario-migrate-config.bin",
+            &[
+                0x16, 0x00, 0x00, 0x00, // op=22: migrate-set-parameters(max-bandwidth=0)
+                0x16, 0x07, 0x00, 0x00, // op=22: migrate-set-parameters(max-cpu-throttle=0)
+                0x17, 0x00, 0x00, 0x00, // op=23: migrate-set-capabilities(xbzrle=true)
+                0x00, 0x09, 0x00, 0x00, // op=0:  QUERY_COMMANDS[9] = query-migrate
+            ],
+        ),
+        // Scenario: object_add → balloon → qom-set on object → object_del
+        // Tests memory balloon interaction with QOM object lifecycle.
+        (
+            "seed-scenario-balloon-object.bin",
+            &[
+                0x06, 0x00, 0x08, 0x00, // op=6: object-add(memory-backend-ram, 8MB)
+                0x12, 0x01, 0x00, 0x00, // op=18: balloon(64MB)
+                0x12, 0x00, 0x00, 0x01, // op=18: query-balloon
+                0x07, 0x00, 0x00, 0x00, // op=7: object-del(obj0)
+            ],
+        ),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
@@ -1504,6 +1620,7 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
     let chunk_mutator = StdScheduledMutator::new(tuple_list!(
         ChunkArgMutator::default(),
         ChunkOpMutator::default(),
+        ChunkTrimMutator::new(cfg.max_commands),
     ));
     let queue_sync_stage = SyncFromDiskStage::with_from_file(paths.queue_root.clone());
     let sync_interval = cfg.sync_interval;
