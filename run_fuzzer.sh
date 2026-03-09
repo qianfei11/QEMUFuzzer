@@ -16,10 +16,9 @@ export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0
 export UBSAN_OPTIONS=halt_on_error=0:print_stacktrace=1
 
 # Launch ASan campaign as a background loop sharing the same corpus.
-# Workers use IDs 8-11 (vanilla uses 0-7) to avoid queue directory conflicts.
-# Each worker is a separate process (--worker-id N --jobs 1) so they can be
-# individually restarted on failure and cross-sync with vanilla workers.
-# ASan is ~2-3× slower than vanilla; 4 workers ≈ 1-2× vanilla throughput.
+# Workers use IDs 8-9 (vanilla uses 0-7) to avoid queue directory conflicts.
+# ASan QEMU startup overhead is ~1400 ms; persistent execution (session-length 50)
+# amortises this over 50 testcases giving ~20-30 ms/exec effective rate.
 run_asan_campaign() {
   if [ ! -x "$ASAN_BIN" ]; then
     echo "[asan] ASan QEMU not found at $ASAN_BIN – skipping ASan campaign." >&2
@@ -27,30 +26,31 @@ run_asan_campaign() {
   fi
   mkdir -p "$LOG_DIR" crashes-asan
   while true; do
-    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [asan] Starting ASan campaign (workers 008-011)..." \
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [asan] Starting ASan campaign (workers 008-009)..." \
       | tee -a "$LOG_DIR/campaign-asan.log"
 
-    # Launch 4 workers in parallel, each with a unique ID that doesn't overlap vanilla.
+    # Launch 2 workers in parallel with unique IDs that don't overlap vanilla.
     local asan_pids=()
-    for i in 0 1 2 3; do
+    for i in 0 1; do
       wid=$((i + 8))
       "$BIN" \
         --qemu-bin "$ASAN_BIN" \
         --machine pc \
-        --iterations 50000 \
-        --timeout-ms 8000 \
+        --iterations 100000 \
+        --timeout-ms 10000 \
         --max-commands 24 \
         --worker-id "$wid" \
         --jobs 1 \
         --seed-dir ./corpus \
         --sync-dir ./sync \
         --sync-interval 200 \
+        --session-length 50 \
         --crashes-dir ./crashes-asan \
         2>&1 | tee -a "$LOG_DIR/campaign-asan.log" &
       asan_pids+=($!)
     done
 
-    # Wait for all 4 workers to finish (or fail).
+    # Wait for both workers to finish (or fail).
     for pid in "${asan_pids[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
@@ -77,13 +77,14 @@ while true; do
   "$BIN" \
     --qemu-bin /usr/bin/qemu-system-x86_64 \
     --machine pc \
-    --iterations 200000 \
+    --iterations 500000 \
     --timeout-ms 4000 \
     --max-commands 24 \
     --jobs 8 \
     --seed-dir ./corpus \
     --sync-dir ./sync \
     --sync-interval 200 \
+    --session-length 500 \
     --crashes-dir ./crashes \
     2>&1 | tee -a "$LOG_DIR/campaign.log"
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Campaign finished, restarting..." | tee -a "$LOG_DIR/campaign.log"

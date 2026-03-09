@@ -1,10 +1,13 @@
 use std::{
     collections::hash_map::DefaultHasher,
     env, fs,
+    fmt,
     hash::{Hash, Hasher},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
+    marker::PhantomData,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -12,23 +15,23 @@ use std::{
 use libafl::{
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::SimpleEventManager,
-    executors::{command::CommandConfigurator, CommandExecutor},
+    executors::{Executor, ExitKind, HasObservers},
     feedback_or,
     feedbacks::{CrashFeedback, NewHashFeedback, TimeFeedback, TimeoutFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasBytesVec, HasTargetBytes, Input, UsesInput},
     monitors::SimpleMonitor,
     mutators::{havoc_mutations, MutationResult, Mutator, StdScheduledMutator},
-    observers::{Observer, ObserverWithHashField, TimeObserver},
+    observers::{Observer, ObserversTuple, ObserverWithHashField, TimeObserver, UsesObservers},
     schedulers::QueueScheduler,
     stages::{IfStage, StdMutationalStage, SyncFromDiskStage},
-    state::{HasCorpus, HasExecutions, HasRand, HasSolutions, StdState},
+    state::{HasCorpus, HasExecutions, HasRand, HasSolutions, State, StdState, UsesState},
     Error,
 };
 use libafl_bolts::{
     current_nanos,
     rands::{Rand, StdRand},
-    tuples::tuple_list,
+    tuples::{tuple_list, MatchName},
     AsSlice, Named,
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +45,9 @@ const DEFAULT_ITERS: u64 = 5000;
 const DEFAULT_TIMEOUT_MS: u64 = 1200;
 const DEFAULT_MAX_COMMANDS: usize = 16;
 const DEFAULT_SYNC_INTERVAL: u64 = 50;
+/// How many testcases to run in a single persistent QEMU session before restarting.
+/// Amortises QEMU startup cost (~57 ms vanilla, ~1400 ms ASan) over many runs.
+const DEFAULT_SESSION_LENGTH: usize = 500;
 
 const DEVICE_DRIVERS: &[&str] = &[
     // PCI NIC drivers – all hotplug-capable on i440fx (pc) machine
@@ -54,13 +60,25 @@ const DEVICE_DRIVERS: &[&str] = &[
     "virtio-rng-pci",
     "virtio-serial-pci",
     "virtio-balloon-pci",
+    "virtio-scsi-pci",
     // USB input devices (require ich9-usb-uhci1 in base command)
     "usb-mouse",
     "usb-kbd",
     "usb-tablet",
+    "usb-storage",
+    "usb-audio",
     // Test/debug devices
     "pci-testdev",
     "edu",
+    // Additional NIC variants
+    "i82557a",
+    "e1000e",
+    "vmxnet3",
+    // Audio
+    "intel-hda",
+    "hda-duplex",
+    // Additional virtio
+    "virtio-rng-pci",
 ];
 const QUERY_COMMANDS: &[&str] = &[
     "query-status",
@@ -75,6 +93,10 @@ const QUERY_COMMANDS: &[&str] = &[
     "query-blockdev",
     "query-chardev",
     "query-commands",
+    "query-block",
+    "query-netdev",
+    "query-migrate",
+    "query-acpi-ospm-status",
 ];
 const HMP_COMMANDS: &[&str] = &[
     "help",
@@ -89,6 +111,23 @@ const HMP_COMMANDS: &[&str] = &[
     "info mem",
     "info lapic",      // was "info registers" - CPU registers vary with SeaBIOS
     "info blockstats",
+    "info usb",
+    "info balloon",
+    "info mice",
+];
+/// Qcodes for the QMP `send-key` command.  These keys exercise:
+///   - i8042 PS/2 keyboard controller scancode translation
+///   - SeaBIOS keyboard interrupt handler (IRQ 1)
+///   - ACPI wake-from-S3 path (ctrl-alt-del triggers warm reset)
+const SENDKEY_KEYS: &[&str] = &[
+    "ret", "esc", "tab", "spc", "backspace",
+    "f1", "f2", "f8", "f10", "f12",
+    "ctrl-alt-delete",
+    "ctrl-c", "ctrl-d", "ctrl-z",
+    "alt-f4",
+    "a", "b", "c", "x", "y", "z",
+    "0", "1", "9",
+    "up", "down", "left", "right",
 ];
 const CHARDEV_BACKENDS: &[&str] = &["null", "memory", "ringbuf"];
 const QOM_PATHS: &[&str] = &[
@@ -141,6 +180,8 @@ struct Config {
     debug_qemu: bool,
     validate_dir: Option<PathBuf>,
     validated_dir: Option<PathBuf>,
+    /// Testcases per persistent QEMU session (0 = spawn-per-testcase fallback).
+    session_length: usize,
 }
 
 impl Default for Config {
@@ -160,6 +201,7 @@ impl Default for Config {
             debug_qemu: false,
             validate_dir: None,
             validated_dir: None,
+            session_length: DEFAULT_SESSION_LENGTH,
         }
     }
 }
@@ -416,55 +458,6 @@ fn build_base_qemu_command(qemu_bin: &Path, machine: &str, debug: bool) -> Comma
     cmd
 }
 
-#[derive(Debug)]
-struct QmpConfigurator {
-    qemu_bin: PathBuf,
-    machine: String,
-    timeout: Duration,
-    max_commands: usize,
-    debug_child: bool,
-}
-
-impl QmpConfigurator {
-    fn command_template(&self) -> Command {
-        let mut cmd =
-            build_base_qemu_command(&self.qemu_bin, &self.machine, self.debug_child);
-        cmd.stdout(Stdio::piped());
-        cmd
-    }
-}
-
-impl CommandConfigurator for QmpConfigurator {
-    fn spawn_child<I>(&mut self, input: &I) -> Result<Child, Error>
-    where
-        I: Input + HasTargetBytes,
-    {
-        let mut child = self.command_template().spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::illegal_state("failed to capture child stdin"))?;
-        let payload = qmp_program_from_bytes(input.target_bytes().as_slice(), self.max_commands);
-
-        if let Err(err) = stdin.write_all(&payload) {
-            if err.kind() != io::ErrorKind::BrokenPipe {
-                return Err(err.into());
-            }
-        }
-        if let Err(err) = stdin.flush() {
-            if err.kind() != io::ErrorKind::BrokenPipe {
-                return Err(err.into());
-            }
-        }
-        drop(stdin);
-        Ok(child)
-    }
-
-    fn exec_timeout(&self) -> Duration {
-        self.timeout
-    }
-}
-
 fn push_exec(cmds: &mut String, exec: &str) {
     cmds.push_str("{\"execute\":\"");
     cmds.push_str(exec);
@@ -596,8 +589,44 @@ fn push_blockdev_del(cmds: &mut String, node_name: &str) {
     cmds.push_str("\"}}\n");
 }
 
+/// Op 24: send-key — deliver a single key (qcode) to the guest keyboard controller.
+/// Exercises the i8042 PS/2 KBC scancode translation path, SeaBIOS IRQ-1 handler,
+/// and ACPI warm-reset on ctrl-alt-delete.
+fn push_send_key(cmds: &mut String, key: &str) {
+    cmds.push_str(
+        "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[{\"type\":\"qcode\",\"data\":\"",
+    );
+    cmds.push_str(key);
+    cmds.push_str("\"}]}}\n");
+}
+
+/// Op 25: mouse_move — deliver relative pointer motion via the HMP monitor.
+/// Exercises PS/2 AUX-port mouse emulation and USB tablet absolute-position logic.
+fn push_mouse_move(cmds: &mut String, dx: i8, dy: i8) {
+    cmds.push_str("{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"mouse_move ");
+    cmds.push_str(&dx.to_string());
+    cmds.push(' ');
+    cmds.push_str(&dy.to_string());
+    cmds.push_str("\"}}\n");
+}
+
+/// Op 25b: mouse_button — emits a mouse button press/release.
+fn push_mouse_button(cmds: &mut String, button_mask: u8) {
+    cmds.push_str("{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"mouse_button ");
+    cmds.push_str(&button_mask.to_string());
+    cmds.push_str("\"}}\n");
+}
+
+/// Op 26: screendump — requests a VGA framebuffer capture.
+/// Exercises the VGA VRAM readout path and display backend.  Writing to /dev/null
+/// avoids filling the disk.
+fn push_screendump(cmds: &mut String) {
+    cmds.push_str(
+        "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"/dev/null\"}}\n",
+    );
+}
+
 // Op 18: memory balloon – request the guest to surrender/claim memory.
-// Requires virtio-balloon-pci device; without it QEMU returns GenericError.
 fn push_balloon(cmds: &mut String, value_mb: u64) {
     let value_bytes = value_mb.saturating_mul(1024 * 1024);
     cmds.push_str("{\"execute\":\"balloon\",\"arguments\":{\"value\":");
@@ -724,8 +753,8 @@ where
         if byte_idx >= bytes.len() {
             return Ok(MutationResult::Skipped);
         }
-        // Write a direct op index so b0 % 24 lands exactly on the chosen op.
-        bytes[byte_idx] = state.rand_mut().below(24) as u8;
+        // Write a direct op index so b0 % 28 lands exactly on the chosen op.
+        bytes[byte_idx] = state.rand_mut().below(28) as u8;
         Ok(MutationResult::Mutated)
     }
 }
@@ -787,7 +816,12 @@ where
     }
 }
 
-fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
+/// Build a QMP command sequence from the raw fuzzer `data` bytes.
+///
+/// When `persistent` is **true** the trailing `quit` command is omitted.
+/// The caller is responsible for appending a sentinel (e.g. `query-version`)
+/// and detecting the end of the testcase via the sentinel response.
+fn qmp_program_from_bytes(data: &[u8], max_commands: usize, persistent: bool) -> Vec<u8> {
     let mut cmds = String::with_capacity(1024);
     let mut next_device_id: u64 = 0;
     let mut next_object_id: u64 = 0;
@@ -814,7 +848,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
         let b3 = chunk.get(3).copied().unwrap_or(0);
-        let op = b0 % 24;
+        let op = b0 % 28;
 
         match op {
             0 => {
@@ -1014,7 +1048,7 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 let (key, val) = MIGRATE_PARAMS[(b1 as usize) % MIGRATE_PARAMS.len()];
                 push_migrate_set_parameters(&mut cmds, key, val);
             }
-            _ => {
+            23 => {
                 // Op 23: migrate-set-capabilities — toggle individual migration flags.
                 // Many capability combinations are not well tested; enabling rdma-pin-all
                 // without RDMA hardware, or combining postcopy-ram + compression, can
@@ -1022,6 +1056,51 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
                 let cap   = MIGRATE_CAPS[(b1 as usize) % MIGRATE_CAPS.len()];
                 let state = b2 & 1 == 0;
                 push_migrate_set_capabilities(&mut cmds, cap, state);
+            }
+            24 => {
+                // Op 24: send-key — inject a key event into the guest PS/2 keyboard
+                // controller (i8042).  Exercises IRQ-1 delivery, KBC scancode translation,
+                // and SeaBIOS keyboard interrupt handler.  ctrl-alt-delete specifically
+                // triggers a warm-reset path through the i8042 pulse-output-port mechanism.
+                let key = SENDKEY_KEYS[(b1 as usize) % SENDKEY_KEYS.len()];
+                push_send_key(&mut cmds, key);
+            }
+            25 => {
+                // Op 25: mouse events — relative pointer motion and button press/release.
+                // Exercises the PS/2 AUX-port emulation (i8042 command 0xD4) for mouse,
+                // and USB tablet absolute-position logic (virtio-input, UHCI transfer rings).
+                if b3 & 1 == 0 {
+                    // Relative motion: dx and dy in [-64, 63]
+                    let dx = (b1 as i8).wrapping_shr(1);
+                    let dy = (b2 as i8).wrapping_shr(1);
+                    push_mouse_move(&mut cmds, dx, dy);
+                } else {
+                    // Button: mask 0–7 (bits: left=1, middle=2, right=4)
+                    let mask = b1 & 0x07;
+                    push_mouse_button(&mut cmds, mask);
+                }
+            }
+            26 => {
+                // Op 26: screendump — read the VGA framebuffer and write to /dev/null.
+                // Exercises the VGA VRAM readout path, the display surface blitting code,
+                // and any registered DisplaySurface callback in the display backend.
+                // Sending this repeatedly while hotplugging devices stresses concurrency
+                // between the VGA display loop and device model tear-down.
+                push_screendump(&mut cmds);
+            }
+            _ => {
+                // Op 27: extended QMP queries — exercises additional QEMU subsystems.
+                // Selects among several commands to avoid a single overloaded op:
+                //   query-pci:  scans the PCI bus hierarchy → BDF enumeration code
+                //   query-rx-filter: reads NIC receive filter tables → virtio-net code
+                //   query-named-block-nodes: lists block layer graph → blk subsystem
+                //   rtc-reset-reinjection: clears lost-tick counter → RTC/PIT code
+                match b1 % 4 {
+                    0 => push_exec(&mut cmds, "query-pci"),
+                    1 => push_exec(&mut cmds, "query-rx-filter"),
+                    2 => push_exec(&mut cmds, "query-named-block-nodes"),
+                    _ => push_exec(&mut cmds, "rtc-reset-reinjection"),
+                }
             }
         }
     }
@@ -1045,8 +1124,309 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize) -> Vec<u8> {
     for node_name in &live_blockdevs {
         push_blockdev_del(&mut cmds, node_name);
     }
-    push_exec(&mut cmds, "quit");
+    if !persistent {
+        push_exec(&mut cmds, "quit");
+    }
     cmds.into_bytes()
+}
+
+// ── Persistent QMP executor ───────────────────────────────────────────────────
+//
+// Keeps a QEMU process alive across `session_length` testcases to amortise the
+// per-process startup cost (~57 ms vanilla, ~1 400 ms ASan) over many runs.
+//
+// Protocol per testcase:
+//   1. Build command payload (no `quit`) using `qmp_program_from_bytes(..., true)`.
+//   2. Write payload + sentinel `{"execute":"query-version"}\n` to stdin.
+//   3. Read lines until the sentinel response (`{"return":{"qemu":`) arrives.
+//   4. Hash collected stdout via `observers.observe_stdout()`.
+//   5. Restart session if QEMU exits early, times out, or session_length reached.
+//
+// QEMU crashes (non-zero exit) return `ExitKind::Crash` so LibAFL saves them.
+// Clean early exits (exit 0, e.g., `-no-reboot` after guest reset) restart the
+// session and return `ExitKind::Ok` so they are not saved as objectives.
+
+/// Sentinel QMP command appended after each persistent testcase payload.
+/// `query-version` returns `{"return":{"qemu":{...}}}` which contains the
+/// unique substring `"qemu":` — not present in any other response.
+const PERSISTENT_SENTINEL: &[u8] = b"{\"execute\":\"query-version\"}\n";
+
+/// One running QEMU session used by `PersistentQmpExecutor`.
+struct QmpSession {
+    child: Child,
+    stdin: io::BufWriter<ChildStdin>,
+    /// Lines from QEMU stdout, sent by the reader thread.
+    rx: mpsc::Receiver<io::Result<String>>,
+}
+
+impl QmpSession {
+    /// Spawn a fresh QEMU process, perform the QMP handshake, and return a
+    /// ready-to-use session.  Returns `Err` if QEMU fails to start or the
+    /// initial greeting does not arrive within 10 seconds.
+    fn start(qemu_bin: &Path, machine: &str, debug: bool) -> io::Result<Self> {
+        let mut cmd = build_base_qemu_command(qemu_bin, machine, debug);
+        cmd.stdout(Stdio::piped());
+        let mut child = cmd.spawn()?;
+
+        let stdout: ChildStdout = child.stdout.take().expect("stdout piped");
+        let (tx, rx) = mpsc::channel::<io::Result<String>>();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stdin_raw: ChildStdin = child.stdin.take().expect("stdin piped");
+        let mut session = QmpSession {
+            child,
+            stdin: io::BufWriter::new(stdin_raw),
+            rx,
+        };
+
+        // QMP handshake: wait for greeting, then send qmp_capabilities.
+        session.drain_greeting(Duration::from_secs(10))?;
+        Ok(session)
+    }
+
+    /// Consume lines from the reader thread until we see the `qmp_capabilities`
+    /// success response `{"return": {}}`.  This primes the session.
+    fn drain_greeting(&mut self, timeout: Duration) -> io::Result<()> {
+        // Send qmp_capabilities immediately; the greeting line may arrive
+        // concurrently — we just need to consume everything up to the first
+        // `{"return"` which is the capabilities ACK.
+        self.stdin.write_all(b"{\"execute\":\"qmp_capabilities\"}\n")?;
+        self.stdin.flush()?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "QMP greeting timeout"));
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => {
+                    if line.contains("\"return\"") {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "QMP greeting timeout"))
+                }
+            }
+        }
+    }
+
+    /// Run one testcase: write `payload` + sentinel, collect stdout until the
+    /// sentinel response, then return the raw stdout and exit kind.
+    fn run_testcase(
+        &mut self,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> io::Result<(Vec<u8>, ExitKind)> {
+        // Write the command payload (no `quit`) followed by the sentinel.
+        if let Err(e) = self.stdin.write_all(payload) {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(e);
+            }
+            // Broken pipe → QEMU already exited
+            return Ok((Vec::new(), ExitKind::Crash));
+        }
+        if let Err(e) = self.stdin.write_all(PERSISTENT_SENTINEL) {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(e);
+            }
+            return Ok((Vec::new(), ExitKind::Crash));
+        }
+        if let Err(e) = self.stdin.flush() {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(e);
+            }
+            return Ok((Vec::new(), ExitKind::Crash));
+        }
+
+        let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok((stdout_buf, ExitKind::Timeout));
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => {
+                    stdout_buf.extend_from_slice(line.as_bytes());
+                    stdout_buf.push(b'\n');
+                    // `query-version` response always contains `"qemu":{` or `"qemu": {`
+                    if find_bytes(line.as_bytes(), b"\"qemu\":{").is_some()
+                        || find_bytes(line.as_bytes(), b"\"qemu\": {").is_some()
+                    {
+                        return Ok((stdout_buf, ExitKind::Ok));
+                    }
+                }
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Reader thread terminated → QEMU process has exited.
+                    let exit_kind = match self.child.try_wait() {
+                        Ok(Some(status)) if status.success() => ExitKind::Ok,
+                        _ => ExitKind::Crash,
+                    };
+                    return Ok((stdout_buf, exit_kind));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Ok((stdout_buf, ExitKind::Timeout));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for QmpSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A persistent LibAFL executor that reuses a single QEMU process across
+/// multiple testcases.  Falls back to spawning a fresh process after
+/// `session_length` executions, any crash, or any timeout.
+pub struct PersistentQmpExecutor<OT, S> {
+    qemu_bin: PathBuf,
+    machine: String,
+    timeout: Duration,
+    max_commands: usize,
+    session_length: usize,
+    debug_child: bool,
+    /// The currently running QEMU session (None if not yet started or after restart).
+    session: Option<QmpSession>,
+    /// How many testcases have been run in the current session.
+    session_exec_count: usize,
+    observers: OT,
+    phantom: PhantomData<S>,
+}
+
+impl<OT, S> PersistentQmpExecutor<OT, S> {
+    pub fn new(
+        qemu_bin: PathBuf,
+        machine: String,
+        timeout: Duration,
+        max_commands: usize,
+        session_length: usize,
+        debug_child: bool,
+        observers: OT,
+    ) -> Self {
+        Self {
+            qemu_bin,
+            machine,
+            timeout,
+            max_commands,
+            session_length,
+            debug_child,
+            session: None,
+            session_exec_count: 0,
+            observers,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<OT, S> fmt::Debug for PersistentQmpExecutor<OT, S>
+where
+    OT: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistentQmpExecutor")
+            .field("qemu_bin", &self.qemu_bin)
+            .field("machine", &self.machine)
+            .field("session_exec_count", &self.session_exec_count)
+            .finish()
+    }
+}
+
+impl<OT, S> UsesObservers for PersistentQmpExecutor<OT, S>
+where
+    OT: ObserversTuple<S>,
+    S: State,
+{
+    type Observers = OT;
+}
+
+impl<OT, S> UsesState for PersistentQmpExecutor<OT, S>
+where
+    S: State,
+{
+    type State = S;
+}
+
+impl<OT, S> HasObservers for PersistentQmpExecutor<OT, S>
+where
+    OT: ObserversTuple<S>,
+    S: State,
+{
+    fn observers(&self) -> &OT {
+        &self.observers
+    }
+    fn observers_mut(&mut self) -> &mut OT {
+        &mut self.observers
+    }
+}
+
+impl<EM, OT, S, Z> Executor<EM, Z> for PersistentQmpExecutor<OT, S>
+where
+    EM: UsesState<State = S>,
+    S: State + HasExecutions,
+    S::Input: HasTargetBytes,
+    OT: fmt::Debug + MatchName + ObserversTuple<S>,
+    Z: UsesState<State = S>,
+{
+    fn run_target(
+        &mut self,
+        _fuzzer: &mut Z,
+        state: &mut S,
+        _mgr: &mut EM,
+        input: &S::Input,
+    ) -> Result<ExitKind, Error> {
+        *state.executions_mut() += 1;
+
+        // Build the command payload without `quit`.
+        let payload =
+            qmp_program_from_bytes(input.target_bytes().as_slice(), self.max_commands, true);
+
+        // Ensure a live session exists.
+        if self.session.is_none() {
+            match QmpSession::start(&self.qemu_bin, &self.machine, self.debug_child) {
+                Ok(s) => {
+                    self.session = Some(s);
+                    self.session_exec_count = 0;
+                }
+                Err(e) => return Err(Error::unknown(e.to_string())),
+            }
+        }
+
+        let (stdout_buf, exit_kind) = self
+            .session
+            .as_mut()
+            .unwrap()
+            .run_testcase(&payload, self.timeout)
+            .unwrap_or_else(|_| (Vec::new(), ExitKind::Crash));
+
+        // Feed collected output to observers (the StdOutHashObserver reads this).
+        self.observers.observe_stdout(&stdout_buf);
+
+        self.session_exec_count += 1;
+
+        // Restart if we hit a crash/timeout or the session limit.
+        if matches!(exit_kind, ExitKind::Crash | ExitKind::Timeout)
+            || self.session_exec_count >= self.session_length
+        {
+            self.session = None;
+        }
+
+        Ok(exit_kind)
+    }
 }
 
 fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
@@ -1055,7 +1435,7 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let seeds: [(&str, &[u8]); 35] = [
+    let seeds: [(&str, &[u8]); 44] = [
         ("seed-query.bin", &[0x00, 0x00, 0x00, 0x00]),
         ("seed-hmp.bin", &[0x01, 0x00, 0x00, 0x00]),
         ("seed-device-add.bin", &[0x02, 0x00, 0x00, 0x02, 0x01, 0x00]),
@@ -1188,6 +1568,35 @@ fn ensure_seed_corpus(path: &Path) -> io::Result<()> {
                 0x07, 0x00, 0x00, 0x00, // op=7: object-del(obj0)
             ],
         ),
+        // ── New ops 24-27 ──────────────────────────────────────────────────────
+        // op=24: send-key(ret) — press Enter, exercises i8042 KBC + SeaBIOS IRQ-1
+        ("seed-sendkey-ret.bin",    &[0x18, 0x00, 0x00, 0x00]),
+        // op=24: send-key(ctrl-alt-delete) — triggers i8042 pulse-output-port reset
+        ("seed-sendkey-cad.bin",    &[0x18, 0x0a, 0x00, 0x00]),
+        // op=24: send-key(f12) — PXE / BIOS boot menu key
+        ("seed-sendkey-f12.bin",    &[0x18, 0x09, 0x00, 0x00]),
+        // op=25: mouse_move(20, 10) — exercises PS/2 AUX and USB tablet paths
+        ("seed-mouse-move.bin",     &[0x19, 0x14, 0x0a, 0x00]),
+        // op=25: mouse_button(1) — left-click press
+        ("seed-mouse-button.bin",   &[0x19, 0x01, 0x00, 0x01]),
+        // op=26: screendump → /dev/null — exercises VGA framebuffer readout
+        ("seed-screendump.bin",     &[0x1a, 0x00, 0x00, 0x00]),
+        // op=27: query-pci — walks PCI bus hierarchy
+        ("seed-query-pci.bin",      &[0x1b, 0x00, 0x00, 0x00]),
+        // op=27: rtc-reset-reinjection — clears RTC lost-tick counter
+        ("seed-rtc-reset.bin",      &[0x1b, 0x03, 0x00, 0x00]),
+        // Scenario: device_add(usb-tablet) → mouse_move → mouse_button → device_del
+        // Tests USB tablet hotplug + HID input delivery path.
+        (
+            "seed-scenario-usb-mouse.bin",
+            &[
+                0x02, 0x0b, 0x00, 0x00, // op=2:  device_add(usb-tablet, dev0)
+                0x19, 0x20, 0x10, 0x00, // op=25: mouse_move(16, 8)
+                0x19, 0x01, 0x00, 0x01, // op=25: mouse_button(1)
+                0x18, 0x00, 0x00, 0x00, // op=24: send-key(ret)
+                0x03, 0x00, 0x00, 0x00, // op=3:  device_del(dev0)
+            ],
+        ),
     ];
     for (name, data) in seeds {
         fs::write(path.join(name), data)?;
@@ -1263,7 +1672,7 @@ enum ReplayVerdict {
 }
 
 fn replay_one_input(cfg: &Config, input: &BytesInput) -> io::Result<ReplayVerdict> {
-    let payload = qmp_program_from_bytes(input.target_bytes().as_slice(), cfg.max_commands);
+    let payload = qmp_program_from_bytes(input.target_bytes().as_slice(), cfg.max_commands, false);
     let mut cmd = build_base_qemu_command(&cfg.qemu_bin, &cfg.machine, cfg.debug_qemu);
     cmd.stdout(Stdio::null());
 
@@ -1477,6 +1886,9 @@ fn print_help() {
     println!(
         "  --sync-interval N     Queue sync stage period in fuzz iterations (default: {DEFAULT_SYNC_INTERVAL})"
     );
+    println!(
+        "  --session-length N    Testcases per persistent QEMU session, 0=disable (default: {DEFAULT_SESSION_LENGTH})"
+    );
     println!("  --validate-dir PATH   Validate corpus files under PATH (replay mode)");
     println!("  --validated-dir PATH  Output dir for validated results (replay mode)");
     println!("  --debug-qemu          Keep QEMU stderr visible");
@@ -1502,6 +1914,7 @@ fn parse_args() -> Result<Config, String> {
             "--jobs" => cfg.jobs = parse_next::<usize>(&mut args, &arg)?,
             "--worker-id" => cfg.worker_id = Some(parse_next::<usize>(&mut args, &arg)?),
             "--sync-interval" => cfg.sync_interval = parse_next::<u64>(&mut args, &arg)?,
+            "--session-length" => cfg.session_length = parse_next::<usize>(&mut args, &arg)?,
             "--validate-dir" => {
                 cfg.validate_dir = Some(PathBuf::from(parse_next::<String>(&mut args, &arg)?))
             }
@@ -1588,15 +2001,15 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    let qmp_executor = QmpConfigurator {
-        qemu_bin: cfg.qemu_bin.clone(),
-        machine: cfg.machine.clone(),
-        timeout: Duration::from_millis(cfg.timeout_ms),
-        max_commands: cfg.max_commands,
-        debug_child: cfg.debug_qemu,
-    };
-    let mut executor: CommandExecutor<_, _, _> =
-        qmp_executor.into_executor(tuple_list!(time_observer, stdout_hash_observer));
+    let mut executor = PersistentQmpExecutor::new(
+        cfg.qemu_bin.clone(),
+        cfg.machine.clone(),
+        Duration::from_millis(cfg.timeout_ms),
+        cfg.max_commands,
+        if cfg.session_length > 0 { cfg.session_length } else { usize::MAX },
+        cfg.debug_qemu,
+        tuple_list!(time_observer, stdout_hash_observer),
+    );
 
     if state.corpus().count() < 1 {
         let initial_roots = vec![cfg.seed_dir.clone(), paths.queue_root.clone()];
@@ -1741,6 +2154,8 @@ fn launch_parallel_workers(cfg: &Config) -> Result<(), Error> {
             .arg(cfg.max_commands.to_string())
             .arg("--sync-interval")
             .arg(cfg.sync_interval.to_string())
+            .arg("--session-length")
+            .arg(cfg.session_length.to_string())
             .arg("--jobs")
             .arg("1")
             .arg("--worker-id")
