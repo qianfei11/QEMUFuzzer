@@ -17,9 +17,9 @@ use libafl::{
     events::SimpleEventManager,
     executors::{Executor, ExitKind, HasObservers},
     feedback_or,
-    feedbacks::{CrashFeedback, NewHashFeedback, TimeFeedback, TimeoutFeedback},
+    feedbacks::{CrashFeedback, NewHashFeedback, TimeFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
-    inputs::{BytesInput, HasBytesVec, HasTargetBytes, Input, UsesInput},
+    inputs::{BytesInput, HasBytesVec, HasTargetBytes, UsesInput},
     monitors::SimpleMonitor,
     mutators::{havoc_mutations, MutationResult, Mutator, StdScheduledMutator},
     observers::{Observer, ObserversTuple, ObserverWithHashField, TimeObserver, UsesObservers},
@@ -1222,6 +1222,32 @@ impl QmpSession {
 
     /// Run one testcase: write `payload` + sentinel, collect stdout until the
     /// sentinel response, then return the raw stdout and exit kind.
+    /// Poll the child until it exits (up to 150 ms) and return the correct
+    /// `ExitKind`.  Used when a broken-pipe error reveals that QEMU has already
+    /// died before we had a chance to check its exit status.
+    fn check_exit_status(&mut self) -> ExitKind {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        ExitKind::Ok
+                    } else {
+                        ExitKind::Crash
+                    };
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Process hasn't exited yet; treat as unexpected crash.
+                        return ExitKind::Crash;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return ExitKind::Crash,
+            }
+        }
+    }
+
     fn run_testcase(
         &mut self,
         payload: &[u8],
@@ -1232,20 +1258,22 @@ impl QmpSession {
             if e.kind() != io::ErrorKind::BrokenPipe {
                 return Err(e);
             }
-            // Broken pipe → QEMU already exited
-            return Ok((Vec::new(), ExitKind::Crash));
+            // BrokenPipe → QEMU has already exited; check the real exit code
+            // so we don't misclassify a clean exit (e.g. system_reset / -no-reboot)
+            // as a crash.
+            return Ok((Vec::new(), self.check_exit_status()));
         }
         if let Err(e) = self.stdin.write_all(PERSISTENT_SENTINEL) {
             if e.kind() != io::ErrorKind::BrokenPipe {
                 return Err(e);
             }
-            return Ok((Vec::new(), ExitKind::Crash));
+            return Ok((Vec::new(), self.check_exit_status()));
         }
         if let Err(e) = self.stdin.flush() {
             if e.kind() != io::ErrorKind::BrokenPipe {
                 return Err(e);
             }
-            return Ok((Vec::new(), ExitKind::Crash));
+            return Ok((Vec::new(), self.check_exit_status()));
         }
 
         let mut stdout_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -1269,10 +1297,8 @@ impl QmpSession {
                 }
                 Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Reader thread terminated → QEMU process has exited.
-                    let exit_kind = match self.child.try_wait() {
-                        Ok(Some(status)) if status.success() => ExitKind::Ok,
-                        _ => ExitKind::Crash,
-                    };
+                    // Wait briefly to ensure the exit status is available.
+                    let exit_kind = self.check_exit_status();
                     return Ok((stdout_buf, exit_kind));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1418,8 +1444,18 @@ where
 
         self.session_exec_count += 1;
 
-        // Restart if we hit a crash/timeout or the session limit.
+        // Restart if we hit a crash/timeout, the session limit, or QEMU has
+        // already exited on its own (e.g., system_reset with -no-reboot gives
+        // exit code 0 — a clean exit that still invalidates the session).
+        let qemu_already_gone = self
+            .session
+            .as_mut()
+            .and_then(|s| s.child.try_wait().ok())
+            .map(|opt| opt.is_some()) // Some(status) means process has exited
+            .unwrap_or(true);
+
         if matches!(exit_kind, ExitKind::Crash | ExitKind::Timeout)
+            || qemu_already_gone
             || self.session_exec_count >= self.session_length
         {
             self.session = None;
@@ -1984,7 +2020,7 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
         NewHashFeedback::new(&stdout_hash_observer),
         TimeFeedback::with_observer(&time_observer)
     );
-    let mut objective = feedback_or!(CrashFeedback::new(), TimeoutFeedback::new());
+    let mut objective = CrashFeedback::new();
 
     let mut state = StdState::new(
         StdRand::with_seed(current_nanos()),
