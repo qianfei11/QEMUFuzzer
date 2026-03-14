@@ -43,7 +43,7 @@ run_asan_campaign() {
         --jobs 1 \
         --seed-dir ./corpus \
         --sync-dir ./sync \
-        --sync-interval 200 \
+        --sync-interval 2000 \
         --session-length 50 \
         --crashes-dir ./crashes-asan \
         2>&1 | tee -a "$LOG_DIR/campaign-asan.log" &
@@ -83,7 +83,7 @@ while true; do
     --jobs 8 \
     --seed-dir ./corpus \
     --sync-dir ./sync \
-    --sync-interval 200 \
+    --sync-interval 2000 \
     --session-length 500 \
     --crashes-dir ./crashes \
     2>&1 | tee -a "$LOG_DIR/campaign.log"

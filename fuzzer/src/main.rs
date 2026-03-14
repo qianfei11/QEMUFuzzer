@@ -16,8 +16,8 @@ use libafl::{
     corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{Executor, ExitKind, HasObservers},
-    feedback_or,
-    feedbacks::{CrashFeedback, NewHashFeedback, TimeFeedback},
+    feedback_and,
+    feedbacks::{CrashFeedback, NewHashFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasBytesVec, HasTargetBytes, UsesInput},
     monitors::SimpleMonitor,
@@ -981,13 +981,19 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize, persistent: bool) ->
             }
             16 => {
                 // Op 16: system_reset — sends a hard machine reset via QMP.
-                // Hotplugged devices survive the reset (QEMU keeps them attached),
-                // but the guest (SeaBIOS) restarts from scratch and may re-probe them.
-                // This exercises QEMU's machine reset code paths, which are a known
-                // source of use-after-free and improper re-initialization bugs.
-                // Live resource tracking lists are intentionally kept intact: sending
-                // device_del / object-del after a reset is a valid stress scenario.
-                push_exec(&mut cmds, "system_reset");
+                // In persistent mode, system_reset causes QEMU to exit(0) via -no-reboot,
+                // ending the session prematurely.  Across 8 workers and 28 ops, op 16
+                // fires in ~27% of testcases (1 - (27/28)^9), so persistent sessions
+                // average only ~4 testcases before QEMU is killed.  The resulting high
+                // session-restart rate causes divergent QEMU state across sessions, which
+                // in turn produces an enormous number of unique response hashes and blows
+                // up the corpus (9M+ files).  In non-persistent mode the worker restarts
+                // QEMU for every testcase anyway, so system_reset IS still exercised.
+                if persistent {
+                    push_exec(&mut cmds, "query-status");
+                } else {
+                    push_exec(&mut cmds, "system_reset");
+                }
             }
             17 => {
                 // Op 17: qom-set — write a value to a QOM property.
@@ -1026,10 +1032,17 @@ fn qmp_program_from_bytes(data: &[u8], max_commands: usize, persistent: bool) ->
             }
             20 => {
                 // Op 20: inject-nmi — delivers a Non-Maskable Interrupt to all vCPUs.
-                // The guest (SeaBIOS or bare metal) may triple-fault → system reset.
-                // With -no-reboot that causes QEMU to exit; without a guest OS the
-                // NMI is often silently swallowed by the hardware emulation.
-                push_exec(&mut cmds, "inject-nmi");
+                // The bare-metal guest (SeaBIOS) has no NMI handler, so the CPU triple-faults,
+                // which requests a machine reset.  With -no-reboot QEMU converts that reset
+                // into a shutdown and exits with code 0.  This makes inject-nmi equivalent
+                // to system_reset in terms of persistent-session impact: ~3.6% chance per
+                // chunk that the session is terminated prematurely.
+                // In persistent mode, replace with query-status to keep the session alive.
+                if persistent {
+                    push_exec(&mut cmds, "query-status");
+                } else {
+                    push_exec(&mut cmds, "inject-nmi");
+                }
             }
             21 => {
                 // Op 21: set-action — configures what QEMU does on VM lifecycle events.
@@ -1222,11 +1235,12 @@ impl QmpSession {
 
     /// Run one testcase: write `payload` + sentinel, collect stdout until the
     /// sentinel response, then return the raw stdout and exit kind.
-    /// Poll the child until it exits (up to 150 ms) and return the correct
-    /// `ExitKind`.  Used when a broken-pipe error reveals that QEMU has already
-    /// died before we had a chance to check its exit status.
+    /// Poll the child until it exits (up to 2 s) and return the correct
+    /// `ExitKind`.  Under heavy CPU load (10+ workers) QEMU can take 200-500 ms
+    /// to finish cleanup after receiving a reset/shutdown signal; the old 150 ms
+    /// deadline caused premature ExitKind::Crash for clean exit(0) cases.
     fn check_exit_status(&mut self) -> ExitKind {
-        let deadline = Instant::now() + Duration::from_millis(150);
+        let deadline = Instant::now() + Duration::from_millis(2000);
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
@@ -1238,7 +1252,7 @@ impl QmpSession {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        // Process hasn't exited yet; treat as unexpected crash.
+                        // Process hasn't exited after 2 s; treat as unexpected crash.
                         return ExitKind::Crash;
                     }
                     thread::sleep(Duration::from_millis(5));
@@ -2016,11 +2030,18 @@ fn run_worker(cfg: &Config, worker_id: usize) -> Result<(), Error> {
     let time_observer = TimeObserver::new("time");
     let stdout_hash_observer = StdOutHashObserver::new("stdout_hash");
 
-    let mut feedback = feedback_or!(
-        NewHashFeedback::new(&stdout_hash_observer),
-        TimeFeedback::with_observer(&time_observer)
-    );
-    let mut objective = CrashFeedback::new();
+    // Corpus entry: only when QEMU response pattern is structurally new.
+    // TimeFeedback is intentionally excluded: on a loaded machine QEMU execution
+    // time varies enough to produce a "new timing bucket" on nearly every run,
+    // causing exponential corpus growth (9M+ files observed in 26 h).
+    let mut feedback = NewHashFeedback::new(&stdout_hash_observer);
+
+    // Objective entry: crash AND response pattern not yet seen.
+    // The separate NewHashFeedback has its own hash-set so it tracks "novel
+    // crashes" independently from the corpus novelty set.  This prevents the
+    // same crashing input from being written to disk 1246× (observed previously).
+    let obj_hash_dedup = NewHashFeedback::new(&stdout_hash_observer);
+    let mut objective = feedback_and!(CrashFeedback::new(), obj_hash_dedup);
 
     let mut state = StdState::new(
         StdRand::with_seed(current_nanos()),
